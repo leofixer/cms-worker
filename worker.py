@@ -25,7 +25,18 @@ missing = [k for k, v in {
 if missing:
     raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+import httpx
+
+http_client = httpx.Client(
+    timeout=60.0,
+    follow_redirects=True,
+    trust_env=False  # IMPORTANT: ignores proxy env vars that cause the crash
+)
+
+client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    http_client=http_client
+)
 
 def airtable_headers():
     return {
@@ -149,4 +160,5 @@ def main():
         time.sleep(POLL_SECONDS)
 
 if __name__ == "__main__":
+
     main()
