@@ -6,6 +6,8 @@ from urllib.parse import quote
 
 import httpx
 from openai import OpenAI
+import requests
+print("Server IP:", requests.get("https://api.ipify.org").text, flush=True)
 
 # ==================================================
 # VERSION STAMP
@@ -396,3 +398,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
