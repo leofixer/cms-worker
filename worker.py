@@ -167,14 +167,13 @@ Formatting rules:
 
 
 def generate_article(prompt: str) -> str:
-    response = client.chat.completions.create(
-        model="gpt-5",
-        messages=[
-            {"role": "system", "content": "You are a professional content writer who follows instructions exactly."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.8
-    )
+response = client.chat.completions.create(
+    model="gpt-5",
+    messages=[
+        {"role": "system", "content": "You are a professional content writer who follows instructions exactly."},
+        {"role": "user", "content": prompt}
+    ]
+)
 
     return (response.choices[0].message.content or "").strip()
 
@@ -249,3 +248,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
