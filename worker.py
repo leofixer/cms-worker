@@ -6,20 +6,18 @@ from urllib.parse import quote
 
 import httpx
 from openai import OpenAI
-import requests
-print("Server IP:", requests.get("https://api.ipify.org").text, flush=True)
 
 # ==================================================
 # VERSION STAMP
 # ==================================================
-WORKER_VERSION = "v5-zerogpt-detectText-2026-02-23"
+WORKER_VERSION = "v6-zerogpt-success-fix-2026-02-23"
 
 # ==================================================
 # REQUIRED ENV VARS
 # ==================================================
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")  # tblXXXXXXXX recommended
+AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ==================================================
@@ -38,11 +36,9 @@ FINAL_TEXT_FIELD = os.getenv("FINAL_TEXT_FIELD", "Final Article Text")
 LAST_ERROR_FIELD = os.getenv("LAST_ERROR_FIELD", "Last Error")
 
 # ==================================================
-# ZeroGPT (QC step)
+# ZeroGPT
 # ==================================================
 ZEROGPT_API_KEY = os.getenv("ZEROGPT_API_KEY")
-
-# Default to the commonly referenced endpoint; you can override in Render env var.
 ZEROGPT_API_URL = os.getenv(
     "ZEROGPT_API_URL",
     "https://api.zerogpt.com/api/detect/detectText"
@@ -67,19 +63,20 @@ def require_env():
     }.items():
         if not v:
             missing.append(k)
+
     if missing:
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
 
 require_env()
 
-# OpenAI client (proxy-safe)
+# OpenAI client
 http_client = httpx.Client(timeout=60.0, follow_redirects=True, trust_env=False)
 client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
 
 # ==================================================
-# AIRTABLE HELPERS
+# Airtable helpers
 # ==================================================
 def airtable_headers():
     return {
@@ -94,39 +91,46 @@ def airtable_base_url():
 
 
 def airtable_get(params: dict):
-    url = airtable_base_url()
-    r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
+    r = requests.get(
+        airtable_base_url(),
+        headers=airtable_headers(),
+        params=params,
+        timeout=30
+    )
     if r.status_code != 200:
-        print("Airtable GET URL:", r.url, flush=True)
-        print("Airtable GET status:", r.status_code, flush=True)
-        print("Airtable GET response:", r.text, flush=True)
+        print("Airtable GET error:", r.text, flush=True)
         r.raise_for_status()
     return r.json()
 
 
 def list_ready(max_records: int):
-    filter_formula = f'{{{STATUS_FIELD}}}="{READY_VALUE}"'
-    params = {"maxRecords": max_records, "filterByFormula": filter_formula}
-    data = airtable_get(params)
+    formula = f'{{{STATUS_FIELD}}}="{READY_VALUE}"'
+    data = airtable_get({
+        "maxRecords": max_records,
+        "filterByFormula": formula
+    })
     return data.get("records", [])
 
 
 def update_record(record_id: str, fields: dict):
     url = f"{airtable_base_url()}/{record_id}"
-    r = requests.patch(url, headers=airtable_headers(), json={"fields": fields}, timeout=30)
+    r = requests.patch(
+        url,
+        headers=airtable_headers(),
+        json={"fields": fields},
+        timeout=30
+    )
     if r.status_code != 200:
-        print("Airtable PATCH URL:", url, flush=True)
-        print("Airtable PATCH status:", r.status_code, flush=True)
-        print("Airtable PATCH response:", r.text, flush=True)
+        print("Airtable PATCH error:", r.text, flush=True)
         r.raise_for_status()
     return r.json()
 
 
 # ==================================================
-# CONTENT GENERATION
+# Content generation
 # ==================================================
 def build_prompt(fields: dict) -> str:
-    topic = fields.get("Topics") or fields.get("Topic") or "Write an original article."
+    topic = fields.get("Topics") or fields.get("Topic") or "Write an article."
     word_count = fields.get("word count") or fields.get("Word Count") or 700
     tone = fields.get("Tone") or ""
     special = fields.get("Special Content Instructions") or ""
@@ -136,15 +140,15 @@ def build_prompt(fields: dict) -> str:
 
     link_rule = ""
     if anchor and target_url:
-        link_rule = f'Include this exact anchor text once: "{anchor}" linking to {target_url}. Make it natural.'
+        link_rule = f'Include this anchor once: "{anchor}" linking to {target_url}.'
 
-    prompt = f"""
+    return f"""
 Write an original article.
 
 Topic:
 {topic}
 
-Target length:
+Length:
 About {word_count} words.
 
 Tone:
@@ -156,20 +160,18 @@ Special instructions:
 Link requirement:
 {link_rule}
 
-Formatting rules:
-- Put a clear title on the first line.
-- Use subheadings.
-- Avoid repetitive filler.
-- Do not mention AI or detectors.
+Formatting:
+- Title on first line
+- Use subheadings
+- Avoid repetitive filler
 """.strip()
-    return prompt
 
 
 def generate_article(prompt: str) -> str:
     response = client.chat.completions.create(
         model="gpt-5",
         messages=[
-            {"role": "system", "content": "You are a professional content writer who follows instructions exactly."},
+            {"role": "system", "content": "You are a professional content writer."},
             {"role": "user", "content": prompt}
         ]
     )
@@ -177,155 +179,66 @@ def generate_article(prompt: str) -> str:
 
 
 # ==================================================
-# ZeroGPT QC
+# ZeroGPT
 # ==================================================
-def _extract_score_from_zerogpt(data: dict):
-    """
-    Try common response shapes:
-    - isHuman: boolean
-    - aiPercentage / ai_percentage: number 0-100
-    - score/probability: 0-1 or 0-100
-    """
-    # direct booleans
-    if isinstance(data, dict) and "isHuman" in data and isinstance(data["isHuman"], bool):
-        # If it's human, AI score ~ 0; if not, AI score ~ 100 (coarse)
-        return 0.0 if data["isHuman"] else 100.0
-
-    # common % keys
-    for k in ["aiPercentage", "ai_percentage", "aiScore", "ai_score"]:
-        if k in data:
-            try:
-                v = data[k]
-                if isinstance(v, str):
-                    v = v.strip().replace("%", "")
-                return float(v)
-            except Exception:
-                pass
-
-    # generic nested keys
-    candidates = [
-        ("data", "aiPercentage"),
-        ("data", "ai_percentage"),
-        ("result", "aiPercentage"),
-        ("result", "ai_percentage"),
-        ("result", "score"),
-        ("score",),
-        ("probability",),
-    ]
-    for path in candidates:
-        cur = data
-        ok = True
-        for key in path:
-            if isinstance(cur, dict) and key in cur:
-                cur = cur[key]
-            else:
-                ok = False
-                break
-        if ok:
-            try:
-                if isinstance(cur, str):
-                    cur = cur.strip().replace("%", "")
-                val = float(cur)
-                # If returned 0-1, convert to %
-                if 0.0 <= val <= 1.0:
-                    return val * 100.0
-                return val
-            except Exception:
-                pass
-
-    return None
-
-
-def zerogpt_detect(text: str) -> dict:
+def zerogpt_detect(text: str):
     if not ZEROGPT_API_KEY:
-        return {"enabled": False, "reason": "ZEROGPT_API_KEY not set"}
+        return {"enabled": False}
 
-    # Try both common auth styles
-    auth_headers_list = [
-        {"Authorization": f"Bearer {ZEROGPT_API_KEY}"},
-        {"x-api-key": ZEROGPT_API_KEY},
-    ]
+    headers = {
+        "Content-Type": "application/json",
+        "x-api-key": ZEROGPT_API_KEY
+    }
 
-    payloads = [
-        {"text": text},
-        {"input_text": text},
-        {"document": text},
-    ]
+    payload = {"text": text}
 
-    last_error = None
+    r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=60)
 
-    for auth_headers in auth_headers_list:
-        headers = {"Content-Type": "application/json", **auth_headers}
+    raw_text = r.text
 
-        for payload in payloads:
-            try:
-                r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=60)
-                raw = r.text
+    try:
+        data = r.json()
+    except Exception:
+        return {
+            "enabled": True,
+            "error": True,
+            "raw_json": raw_text
+        }
 
-                if r.status_code >= 400:
-                    last_error = {
-                        "enabled": True,
-                        "error": True,
-                        "http_status": r.status_code,
-                        "raw": raw[:20000],
-                        "tried_payload_keys": list(payload.keys()),
-                        "tried_auth": list(auth_headers.keys())[0],
-                        "url": ZEROGPT_API_URL
-                    }
-                    continue
+    # Treat success:false as error
+    if isinstance(data, dict) and data.get("success") is False:
+        return {
+            "enabled": True,
+            "error": True,
+            "raw_json": data
+        }
 
-                try:
-                    data = r.json()
-                except Exception:
-                    last_error = {
-                        "enabled": True,
-                        "error": True,
-                        "http_status": r.status_code,
-                        "raw": raw[:20000],
-                        "tried_payload_keys": list(payload.keys()),
-                        "tried_auth": list(auth_headers.keys())[0],
-                        "url": ZEROGPT_API_URL
-                    }
-                    continue
+    score = None
+    if isinstance(data, dict):
+        if "aiPercentage" in data:
+            score = float(str(data["aiPercentage"]).replace("%", ""))
 
-                score = _extract_score_from_zerogpt(data)
-                return {
-                    "enabled": True,
-                    "error": False,
-                    "score": score,
-                    "raw_json": data,
-                    "url": ZEROGPT_API_URL,
-                    "used_payload_keys": list(payload.keys()),
-                    "used_auth": list(auth_headers.keys())[0]
-                }
-
-            except Exception as e:
-                last_error = {
-                    "enabled": True,
-                    "error": True,
-                    "exception": str(e),
-                    "tried_payload_keys": list(payload.keys()),
-                    "tried_auth": list(auth_headers.keys())[0],
-                    "url": ZEROGPT_API_URL
-                }
-
-    return last_error or {"enabled": True, "error": True, "raw": "Unknown ZeroGPT failure"}
+    return {
+        "enabled": True,
+        "error": False,
+        "score": score,
+        "raw_json": data
+    }
 
 
 # ==================================================
-# PROCESS ONE RECORD
+# Processing
 # ==================================================
 def process_one(record: dict):
     record_id = record["id"]
     fields = record.get("fields", {})
 
-    update_record(record_id, {STATUS_FIELD: DRAFTING_VALUE, LAST_ERROR_FIELD: ""})
+    update_record(record_id, {
+        STATUS_FIELD: DRAFTING_VALUE,
+        LAST_ERROR_FIELD: ""
+    })
 
-    prompt = build_prompt(fields)
-    article = generate_article(prompt)
-
-    if not article or len(article) < 200:
-        raise RuntimeError("Generated article too short.")
+    article = generate_article(build_prompt(fields))
 
     qc = zerogpt_detect(article)
 
@@ -334,68 +247,51 @@ def process_one(record: dict):
         AI_RAW_FIELD: json.dumps(qc, ensure_ascii=False)
     }
 
-    if qc.get("enabled") and not qc.get("error"):
+    if qc.get("error"):
+        patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
+    else:
         score = qc.get("score")
         if score is not None:
-            patch[AI_SCORE_FIELD] = float(score)
-
-            # QC routing only (no auto “rewrite until pass” loops)
-            if float(score) > ZEROGPT_THRESHOLD:
-                patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
-            else:
-                patch[REVIEW_STATUS_FIELD] = REVIEW_APPROVED
+            patch[AI_SCORE_FIELD] = score
+            patch[REVIEW_STATUS_FIELD] = (
+                REVIEW_NEEDS if score > ZEROGPT_THRESHOLD else REVIEW_APPROVED
+            )
         else:
             patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
-    else:
-        # If detector fails, route to review (don’t block delivery entirely)
-        patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
 
     patch[STATUS_FIELD] = DELIVERED_VALUE
     update_record(record_id, patch)
 
 
 # ==================================================
-# MAIN LOOP
+# Main loop
 # ==================================================
 def main():
     print("========================================", flush=True)
     print("WORKER_VERSION:", WORKER_VERSION, flush=True)
-    print("BASE:", AIRTABLE_BASE_ID, flush=True)
-    print("TABLE:", AIRTABLE_TABLE, flush=True)
-    print("STATUS_FIELD:", STATUS_FIELD, "READY_VALUE:", READY_VALUE, flush=True)
-    print("POLL_SECONDS:", POLL_SECONDS, flush=True)
-    print("MAX_RECORDS_PER_CYCLE:", MAX_RECORDS_PER_CYCLE, flush=True)
-    print("httpx version:", httpx.__version__, flush=True)
     print("ZeroGPT URL:", ZEROGPT_API_URL, flush=True)
-    print("ZeroGPT enabled:", bool(ZEROGPT_API_KEY), flush=True)
     print("========================================", flush=True)
 
     while True:
         try:
-            print("Polling Airtable...", flush=True)
-            ready_records = list_ready(MAX_RECORDS_PER_CYCLE)
-            print("Ready records found:", len(ready_records), flush=True)
+            ready = list_ready(MAX_RECORDS_PER_CYCLE)
+            print("Ready records:", len(ready), flush=True)
 
-            for record in ready_records:
-                rid = record["id"]
+            for record in ready:
                 try:
-                    print("Processing:", rid, flush=True)
                     process_one(record)
-                    print("Delivered:", rid, flush=True)
+                    print("Delivered:", record["id"], flush=True)
                 except Exception as e:
-                    msg = str(e)
-                    print("FAILED:", rid, msg, flush=True)
-                    try:
-                        update_record(rid, {STATUS_FIELD: FAILED_VALUE, LAST_ERROR_FIELD: msg[:9000]})
-                    except Exception as inner:
-                        print("Also failed to update Airtable error:", str(inner), flush=True)
+                    update_record(record["id"], {
+                        STATUS_FIELD: FAILED_VALUE,
+                        LAST_ERROR_FIELD: str(e)[:9000]
+                    })
 
-        except Exception as cycle_error:
-            print("Cycle error:", str(cycle_error), flush=True)
+        except Exception as e:
+            print("Cycle error:", str(e), flush=True)
 
         time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
     main()
-
