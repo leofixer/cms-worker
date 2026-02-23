@@ -7,16 +7,16 @@ import httpx
 from openai import OpenAI
 
 # ==================================================
-# VERSION STAMP (VERY IMPORTANT FOR DEBUGGING)
+# VERSION STAMP (FOR DEBUGGING)
 # ==================================================
-WORKER_VERSION = "v2-chatcompletions-2026-02-23"
+WORKER_VERSION = "v3-chatcompletions-clean-2026-02-23"
 
 # ==================================================
-# REQUIRED ENV VARS (Render)
+# REQUIRED ENV VARS
 # ==================================================
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")  # use tblXXXXXXXX (recommended)
+AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")  # use tblXXXXXXXX
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ==================================================
@@ -36,7 +36,7 @@ LAST_ERROR_FIELD = os.getenv("LAST_ERROR_FIELD", "Last Error")
 
 
 # ==================================================
-# ENV VALIDATION
+# ENV CHECK
 # ==================================================
 def require_env():
     missing = []
@@ -61,14 +61,13 @@ require_env()
 http_client = httpx.Client(
     timeout=60.0,
     follow_redirects=True,
-    trust_env=False  # prevents proxy-related crash
+    trust_env=False
 )
 
 client = OpenAI(
     api_key=OPENAI_API_KEY,
     http_client=http_client
 )
-
 
 # ==================================================
 # AIRTABLE HELPERS
@@ -126,7 +125,7 @@ def update_record(record_id: str, fields: dict):
 # CONTENT GENERATION
 # ==================================================
 def build_prompt(fields: dict) -> str:
-    topic = fields.get("Topics") or fields.get("Topic") or "Write an original article on the provided topic."
+    topic = fields.get("Topics") or fields.get("Topic") or "Write an original article."
     word_count = fields.get("word count") or fields.get("Word Count") or 700
     tone = fields.get("Tone") or ""
     special = fields.get("Special Content Instructions") or ""
@@ -167,13 +166,13 @@ Formatting rules:
 
 
 def generate_article(prompt: str) -> str:
-response = client.chat.completions.create(
-    model="gpt-5",
-    messages=[
-        {"role": "system", "content": "You are a professional content writer who follows instructions exactly."},
-        {"role": "user", "content": prompt}
-    ]
-)
+    response = client.chat.completions.create(
+        model="gpt-5",
+        messages=[
+            {"role": "system", "content": "You are a professional content writer who follows instructions exactly."},
+            {"role": "user", "content": prompt}
+        ]
+    )
 
     return (response.choices[0].message.content or "").strip()
 
@@ -194,7 +193,7 @@ def process_one(record: dict):
     article = generate_article(prompt)
 
     if not article or len(article) < 200:
-        raise RuntimeError("Generated article is empty or too short.")
+        raise RuntimeError("Generated article too short.")
 
     update_record(record_id, {
         FINAL_TEXT_FIELD: article,
@@ -211,8 +210,6 @@ def main():
     print("BASE:", AIRTABLE_BASE_ID, flush=True)
     print("TABLE:", AIRTABLE_TABLE, flush=True)
     print("STATUS_FIELD:", STATUS_FIELD, "READY_VALUE:", READY_VALUE, flush=True)
-    print("FINAL_TEXT_FIELD:", FINAL_TEXT_FIELD, flush=True)
-    print("LAST_ERROR_FIELD:", LAST_ERROR_FIELD, flush=True)
     print("POLL_SECONDS:", POLL_SECONDS, flush=True)
     print("MAX_RECORDS_PER_CYCLE:", MAX_RECORDS_PER_CYCLE, flush=True)
     print("httpx version:", httpx.__version__, flush=True)
@@ -248,4 +245,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
