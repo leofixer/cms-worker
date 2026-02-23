@@ -11,7 +11,7 @@ from openai import OpenAI
 # =========================
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")        # pat...
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")    # app...
-AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")        # tbl...  (RECOMMENDED)
+AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")        # tbl... (recommended)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")        # sk...
 
 # =========================
@@ -20,12 +20,14 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")        # sk...
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "120"))
 MAX_RECORDS_PER_CYCLE = int(os.getenv("MAX_RECORDS_PER_CYCLE", "3"))
 
+# Airtable field names / statuses (configurable)
 STATUS_FIELD = os.getenv("STATUS_FIELD", "Status")
 READY_VALUE = os.getenv("READY_VALUE", "Ready")
 DRAFTING_VALUE = os.getenv("DRAFTING_VALUE", "Drafting")
 DELIVERED_VALUE = os.getenv("DELIVERED_VALUE", "Delivered")
 FAILED_VALUE = os.getenv("FAILED_VALUE", "Failed")
 
+# Output/error fields in Airtable
 FINAL_TEXT_FIELD = os.getenv("FINAL_TEXT_FIELD", "Final Article Text")
 LAST_ERROR_FIELD = os.getenv("LAST_ERROR_FIELD", "Last Error")
 
@@ -46,17 +48,20 @@ def require_env():
 
 require_env()
 
-# --- OpenAI client: disable proxy envs (fixes 'proxies' crash) ---
+# --- OpenAI client: disable proxy env vars (fixes 'proxies' crash on hosts like Render) ---
 http_client = httpx.Client(timeout=60.0, follow_redirects=True, trust_env=False)
 client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
 
+# -------------------------
+# Airtable helpers
+# -------------------------
 def airtable_headers():
     return {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
 
 
 def airtable_base_url():
-    # Works with table ID (tbl...) or table name; we still URL-encode for safety
+    # Works with table ID (tbl...) or table name; URL-encode for safety
     table = quote(AIRTABLE_TABLE, safe="")
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
 
@@ -65,7 +70,6 @@ def airtable_get(params: dict):
     url = airtable_base_url()
     r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
     if r.status_code != 200:
-        # Print the body so errors are obvious in Render logs
         print("Airtable URL:", r.url, flush=True)
         print("Airtable status:", r.status_code, flush=True)
         print("Airtable response:", r.text, flush=True)
@@ -83,7 +87,7 @@ def list_ready(max_records: int):
 def update_record(record_id: str, fields: dict):
     url = f"{airtable_base_url()}/{record_id}"
     r = requests.patch(url, headers=airtable_headers(), json={"fields": fields}, timeout=30)
-    if r.status_code not in (200,):
+    if r.status_code != 200:
         print("Airtable PATCH URL:", url, flush=True)
         print("Airtable PATCH status:", r.status_code, flush=True)
         print("Airtable PATCH response:", r.text, flush=True)
@@ -91,7 +95,11 @@ def update_record(record_id: str, fields: dict):
     return r.json()
 
 
+# -------------------------
+# Content generation logic
+# -------------------------
 def build_prompt(fields: dict) -> str:
+    # Try multiple possible column names to avoid breaking if you rename
     topic = fields.get("Topics") or fields.get("Topic") or "Write an original article on the provided topic."
     word_count = fields.get("word count") or fields.get("Word Count") or fields.get("Word count") or 700
     tone = fields.get("Tone") or ""
@@ -132,18 +140,23 @@ Formatting rules:
 
 
 def generate_article(prompt: str) -> str:
-    resp = client.responses.create(
+    # Use Chat Completions for broader compatibility across OpenAI Python SDK versions
+    resp = client.chat.completions.create(
         model="gpt-5",
-        input=prompt,
-        temperature=0.8
+        messages=[
+            {"role": "system", "content": "You are a professional content writer who follows instructions exactly."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.8,
     )
-    return (resp.output_text or "").strip()
+    return (resp.choices[0].message.content or "").strip()
 
 
 def process_one(record: dict):
     record_id = record["id"]
     fields = record.get("fields", {})
 
+    # Mark Drafting (do NOT reference fields that don't exist)
     update_record(record_id, {STATUS_FIELD: DRAFTING_VALUE, LAST_ERROR_FIELD: ""})
 
     prompt = build_prompt(fields)
@@ -155,12 +168,19 @@ def process_one(record: dict):
     update_record(record_id, {FINAL_TEXT_FIELD: article, STATUS_FIELD: DELIVERED_VALUE})
 
 
+# -------------------------
+# Main worker loop
+# -------------------------
 def main():
     print("=== CMS WORKER STARTED ===", flush=True)
     print("BASE:", AIRTABLE_BASE_ID, flush=True)
     print("TABLE:", AIRTABLE_TABLE, flush=True)
     print("STATUS_FIELD:", STATUS_FIELD, "READY_VALUE:", READY_VALUE, flush=True)
+    print("FINAL_TEXT_FIELD:", FINAL_TEXT_FIELD, flush=True)
+    print("LAST_ERROR_FIELD:", LAST_ERROR_FIELD, flush=True)
     print("POLL_SECONDS:", POLL_SECONDS, "MAX_RECORDS_PER_CYCLE:", MAX_RECORDS_PER_CYCLE, flush=True)
+    print("httpx version:", httpx.__version__, flush=True)
+    print("OpenAI client initialized", flush=True)
 
     while True:
         try:
@@ -177,7 +197,10 @@ def main():
                 except Exception as e:
                     msg = str(e)
                     print("FAILED:", rid, msg, flush=True)
-                    update_record(rid, {STATUS_FIELD: FAILED_VALUE, LAST_ERROR_FIELD: msg[:9000]})
+                    try:
+                        update_record(rid, {STATUS_FIELD: FAILED_VALUE, LAST_ERROR_FIELD: msg[:9000]})
+                    except Exception as inner:
+                        print("Also failed to update error field:", str(inner), flush=True)
 
         except Exception as e:
             print("Cycle error:", str(e), flush=True)
