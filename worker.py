@@ -10,7 +10,7 @@ from openai import OpenAI
 # ==================================================
 # VERSION STAMP
 # ==================================================
-WORKER_VERSION = "v4-zerogpt-qc-routing-2026-02-23"
+WORKER_VERSION = "v5-zerogpt-detectText-2026-02-23"
 
 # ==================================================
 # REQUIRED ENV VARS
@@ -31,20 +31,26 @@ READY_VALUE = os.getenv("READY_VALUE", "Ready")
 DRAFTING_VALUE = os.getenv("DRAFTING_VALUE", "Drafting")
 DELIVERED_VALUE = os.getenv("DELIVERED_VALUE", "Delivered")
 FAILED_VALUE = os.getenv("FAILED_VALUE", "Failed")
-NEEDS_REVIEW_VALUE = os.getenv("NEEDS_REVIEW_VALUE", "Needs Review")  # if you add it to Status options
 
 FINAL_TEXT_FIELD = os.getenv("FINAL_TEXT_FIELD", "Final Article Text")
 LAST_ERROR_FIELD = os.getenv("LAST_ERROR_FIELD", "Last Error")
 
+# ==================================================
 # ZeroGPT (QC step)
+# ==================================================
 ZEROGPT_API_KEY = os.getenv("ZEROGPT_API_KEY")
-ZEROGPT_API_URL = os.getenv("ZEROGPT_API_URL")  # YOU set this from zerogpt.com dashboard docs
+
+# Default to the commonly referenced endpoint; you can override in Render env var.
+ZEROGPT_API_URL = os.getenv(
+    "ZEROGPT_API_URL",
+    "https://api.zerogpt.com/api/detect/detectText"
+)
+
 ZEROGPT_THRESHOLD = float(os.getenv("ZEROGPT_THRESHOLD", "15"))
 
 AI_SCORE_FIELD = os.getenv("AI_SCORE_FIELD", "AI Score")
 AI_RAW_FIELD = os.getenv("AI_RAW_FIELD", "AI Raw Response")
 REVIEW_STATUS_FIELD = os.getenv("REVIEW_STATUS_FIELD", "Review Status")
-
 REVIEW_APPROVED = os.getenv("REVIEW_APPROVED", "Approved")
 REVIEW_NEEDS = os.getenv("REVIEW_NEEDS", "Needs Review")
 
@@ -158,7 +164,6 @@ Formatting rules:
 
 
 def generate_article(prompt: str) -> str:
-    # Note: gpt-5 doesn't allow non-default temperature. Keep defaults.
     response = client.chat.completions.create(
         model="gpt-5",
         messages=[
@@ -170,65 +175,41 @@ def generate_article(prompt: str) -> str:
 
 
 # ==================================================
-# ZeroGPT QC (store score + response; route to review)
+# ZeroGPT QC
 # ==================================================
-def zerogpt_detect(text: str) -> dict:
+def _extract_score_from_zerogpt(data: dict):
     """
-    Calls ZeroGPT using the URL you set in ZEROGPT_API_URL.
-    Because providers vary payload shapes, we:
-    - send a simple JSON body containing the text
-    - store raw JSON response
-    - try to extract a numeric "score" from common keys
+    Try common response shapes:
+    - isHuman: boolean
+    - aiPercentage / ai_percentage: number 0-100
+    - score/probability: 0-1 or 0-100
     """
-    if not ZEROGPT_API_KEY or not ZEROGPT_API_URL:
-        return {"enabled": False, "reason": "ZeroGPT not configured"}
+    # direct booleans
+    if isinstance(data, dict) and "isHuman" in data and isinstance(data["isHuman"], bool):
+        # If it's human, AI score ~ 0; if not, AI score ~ 100 (coarse)
+        return 0.0 if data["isHuman"] else 100.0
 
-    headers = {
-        "Authorization": f"Bearer {ZEROGPT_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    # common % keys
+    for k in ["aiPercentage", "ai_percentage", "aiScore", "ai_score"]:
+        if k in data:
+            try:
+                v = data[k]
+                if isinstance(v, str):
+                    v = v.strip().replace("%", "")
+                return float(v)
+            except Exception:
+                pass
 
-    # Most common pattern: send text in a field like "text" or "content".
-    # If your ZeroGPT docs require a different key, tell me and I’ll adjust.
-    payload = {"text": text}
-
-    r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=60)
-    raw_text = r.text
-
-    if r.status_code >= 400:
-        return {
-            "enabled": True,
-            "error": True,
-            "http_status": r.status_code,
-            "raw": raw_text[:20000]
-        }
-
-    try:
-        data = r.json()
-    except Exception:
-        return {
-            "enabled": True,
-            "error": True,
-            "http_status": r.status_code,
-            "raw": raw_text[:20000]
-        }
-
-    # Try common keys for an AI % score
-    # (You may need to tweak once we see your real response schema.)
+    # generic nested keys
     candidates = [
-        ("ai_score",),
+        ("data", "aiPercentage"),
+        ("data", "ai_percentage"),
+        ("result", "aiPercentage"),
+        ("result", "ai_percentage"),
+        ("result", "score"),
         ("score",),
         ("probability",),
-        ("ai_probability",),
-        ("data", "ai_score"),
-        ("data", "score"),
-        ("result", "ai_score"),
-        ("result", "score"),
-        ("prediction", "ai"),
-        ("ai",),
     ]
-
-    score = None
     for path in candidates:
         cur = data
         ok = True
@@ -239,23 +220,94 @@ def zerogpt_detect(text: str) -> dict:
                 ok = False
                 break
         if ok:
-            # If it's a string like "23%" or "0.23", normalize
             try:
                 if isinstance(cur, str):
-                    val = cur.strip().replace("%", "")
-                    score = float(val)
-                else:
-                    score = float(cur)
-                break
+                    cur = cur.strip().replace("%", "")
+                val = float(cur)
+                # If returned 0-1, convert to %
+                if 0.0 <= val <= 1.0:
+                    return val * 100.0
+                return val
             except Exception:
                 pass
 
-    return {
-        "enabled": True,
-        "error": False,
-        "score": score,          # may be None until we map the exact schema
-        "raw_json": data
-    }
+    return None
+
+
+def zerogpt_detect(text: str) -> dict:
+    if not ZEROGPT_API_KEY:
+        return {"enabled": False, "reason": "ZEROGPT_API_KEY not set"}
+
+    # Try both common auth styles
+    auth_headers_list = [
+        {"Authorization": f"Bearer {ZEROGPT_API_KEY}"},
+        {"x-api-key": ZEROGPT_API_KEY},
+    ]
+
+    payloads = [
+        {"text": text},
+        {"input_text": text},
+        {"document": text},
+    ]
+
+    last_error = None
+
+    for auth_headers in auth_headers_list:
+        headers = {"Content-Type": "application/json", **auth_headers}
+
+        for payload in payloads:
+            try:
+                r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=60)
+                raw = r.text
+
+                if r.status_code >= 400:
+                    last_error = {
+                        "enabled": True,
+                        "error": True,
+                        "http_status": r.status_code,
+                        "raw": raw[:20000],
+                        "tried_payload_keys": list(payload.keys()),
+                        "tried_auth": list(auth_headers.keys())[0],
+                        "url": ZEROGPT_API_URL
+                    }
+                    continue
+
+                try:
+                    data = r.json()
+                except Exception:
+                    last_error = {
+                        "enabled": True,
+                        "error": True,
+                        "http_status": r.status_code,
+                        "raw": raw[:20000],
+                        "tried_payload_keys": list(payload.keys()),
+                        "tried_auth": list(auth_headers.keys())[0],
+                        "url": ZEROGPT_API_URL
+                    }
+                    continue
+
+                score = _extract_score_from_zerogpt(data)
+                return {
+                    "enabled": True,
+                    "error": False,
+                    "score": score,
+                    "raw_json": data,
+                    "url": ZEROGPT_API_URL,
+                    "used_payload_keys": list(payload.keys()),
+                    "used_auth": list(auth_headers.keys())[0]
+                }
+
+            except Exception as e:
+                last_error = {
+                    "enabled": True,
+                    "error": True,
+                    "exception": str(e),
+                    "tried_payload_keys": list(payload.keys()),
+                    "tried_auth": list(auth_headers.keys())[0],
+                    "url": ZEROGPT_API_URL
+                }
+
+    return last_error or {"enabled": True, "error": True, "raw": "Unknown ZeroGPT failure"}
 
 
 # ==================================================
@@ -265,10 +317,7 @@ def process_one(record: dict):
     record_id = record["id"]
     fields = record.get("fields", {})
 
-    update_record(record_id, {
-        STATUS_FIELD: DRAFTING_VALUE,
-        LAST_ERROR_FIELD: ""
-    })
+    update_record(record_id, {STATUS_FIELD: DRAFTING_VALUE, LAST_ERROR_FIELD: ""})
 
     prompt = build_prompt(fields)
     article = generate_article(prompt)
@@ -276,46 +325,30 @@ def process_one(record: dict):
     if not article or len(article) < 200:
         raise RuntimeError("Generated article too short.")
 
-    # Run ZeroGPT QC (if configured)
     qc = zerogpt_detect(article)
 
     patch = {
-        FINAL_TEXT_FIELD: article
+        FINAL_TEXT_FIELD: article,
+        AI_RAW_FIELD: json.dumps(qc, ensure_ascii=False)
     }
 
-    # Always store raw response (even if error) so you can debug
-    if qc.get("enabled"):
-        if qc.get("error"):
-            patch[AI_RAW_FIELD] = json.dumps(qc, ensure_ascii=False)
-            # Don’t fail the job because detector is down; route to review
-            patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
-        else:
-            patch[AI_RAW_FIELD] = json.dumps(qc.get("raw_json", {}), ensure_ascii=False)
+    if qc.get("enabled") and not qc.get("error"):
+        score = qc.get("score")
+        if score is not None:
+            patch[AI_SCORE_FIELD] = float(score)
 
-            score = qc.get("score")
-            if score is not None:
-                patch[AI_SCORE_FIELD] = score
-
-                # If score exceeds threshold, route to review (don’t auto “fix”)
-                if score > ZEROGPT_THRESHOLD:
-                    patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
-                else:
-                    patch[REVIEW_STATUS_FIELD] = REVIEW_APPROVED
-            else:
-                # Could not parse score yet; still store raw
+            # QC routing only (no auto “rewrite until pass” loops)
+            if float(score) > ZEROGPT_THRESHOLD:
                 patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
-
-    # Decide final Status
-    # If Review Status is Needs Review, keep status as Delivered (or use Needs Review if you added it)
-    if patch.get(REVIEW_STATUS_FIELD) == REVIEW_NEEDS:
-        # Option A: Keep Delivered but flagged for review
-        patch[STATUS_FIELD] = DELIVERED_VALUE
-
-        # Option B (if you added "Needs Review" to Status single-select):
-        # patch[STATUS_FIELD] = NEEDS_REVIEW_VALUE
+            else:
+                patch[REVIEW_STATUS_FIELD] = REVIEW_APPROVED
+        else:
+            patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
     else:
-        patch[STATUS_FIELD] = DELIVERED_VALUE
+        # If detector fails, route to review (don’t block delivery entirely)
+        patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
 
+    patch[STATUS_FIELD] = DELIVERED_VALUE
     update_record(record_id, patch)
 
 
@@ -331,9 +364,8 @@ def main():
     print("POLL_SECONDS:", POLL_SECONDS, flush=True)
     print("MAX_RECORDS_PER_CYCLE:", MAX_RECORDS_PER_CYCLE, flush=True)
     print("httpx version:", httpx.__version__, flush=True)
-    print("ZeroGPT enabled:", bool(ZEROGPT_API_KEY and ZEROGPT_API_URL), flush=True)
-    if ZEROGPT_API_URL:
-        print("ZeroGPT URL:", ZEROGPT_API_URL, flush=True)
+    print("ZeroGPT URL:", ZEROGPT_API_URL, flush=True)
+    print("ZeroGPT enabled:", bool(ZEROGPT_API_KEY), flush=True)
     print("========================================", flush=True)
 
     while True:
@@ -343,19 +375,16 @@ def main():
             print("Ready records found:", len(ready_records), flush=True)
 
             for record in ready_records:
-                record_id = record["id"]
+                rid = record["id"]
                 try:
-                    print("Processing:", record_id, flush=True)
+                    print("Processing:", rid, flush=True)
                     process_one(record)
-                    print("Delivered:", record_id, flush=True)
+                    print("Delivered:", rid, flush=True)
                 except Exception as e:
-                    error_msg = str(e)
-                    print("FAILED:", record_id, error_msg, flush=True)
+                    msg = str(e)
+                    print("FAILED:", rid, msg, flush=True)
                     try:
-                        update_record(record_id, {
-                            STATUS_FIELD: FAILED_VALUE,
-                            LAST_ERROR_FIELD: error_msg[:9000]
-                        })
+                        update_record(rid, {STATUS_FIELD: FAILED_VALUE, LAST_ERROR_FIELD: msg[:9000]})
                     except Exception as inner:
                         print("Also failed to update Airtable error:", str(inner), flush=True)
 
