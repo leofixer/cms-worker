@@ -11,7 +11,7 @@ from openai import OpenAI
 # ==================================================
 # VERSION
 # ==================================================
-WORKER_VERSION = "v10.1-gen+ragsamples(pyfilter)+qc-under15-needsreview-2026-02-24"
+WORKER_VERSION = "v10.2-gen+ragsamples(pyfilter)+timeouts+qc-under15-needsreview-2026-02-24"
 
 # ==================================================
 # REQUIRED ENV VARS (Render)
@@ -46,8 +46,14 @@ LAST_ERROR_FIELD = os.getenv("LAST_ERROR_FIELD", "Last Error")
 # optional timestamp field (recommended)
 DRAFTING_STARTED_AT_FIELD = os.getenv("DRAFTING_STARTED_AT_FIELD", "Drafting Started At")
 
-# record watchdog
-RECORD_TIMEOUT_SECONDS = int(os.getenv("RECORD_TIMEOUT_SECONDS", "240"))  # 4 min
+# record watchdog (increase to avoid false failures when generation is slow)
+RECORD_TIMEOUT_SECONDS = int(os.getenv("RECORD_TIMEOUT_SECONDS", "600"))  # 10 min default
+
+# ==================================================
+# HTTP TIMEOUTS (Airtable / ZeroGPT)
+# ==================================================
+AIRTABLE_HTTP_TIMEOUT = int(os.getenv("AIRTABLE_HTTP_TIMEOUT", "60"))
+ZEROGPT_HTTP_TIMEOUT = int(os.getenv("ZEROGPT_HTTP_TIMEOUT", "90"))
 
 # ==================================================
 # ZeroGPT (per your docs)
@@ -63,9 +69,11 @@ AI_RAW_FIELD = os.getenv("AI_RAW_FIELD", "AI Raw Response")
 # Style/RAG config (optional)
 # ==================================================
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-TOP_STYLE_SAMPLES = int(os.getenv("TOP_STYLE_SAMPLES", "3"))  # recommend 3 (max 5)
-MAX_STYLE_CHARS_EACH = int(os.getenv("MAX_STYLE_CHARS_EACH", "6000"))  # trim references
-MAX_STYLE_SAMPLES_FETCH = int(os.getenv("MAX_STYLE_SAMPLES_FETCH", "200"))  # fetch up to N embedded, then filter
+
+# Defaults lowered to prevent huge prompts / slow generations
+TOP_STYLE_SAMPLES = int(os.getenv("TOP_STYLE_SAMPLES", "2"))          # recommend 2–3
+MAX_STYLE_CHARS_EACH = int(os.getenv("MAX_STYLE_CHARS_EACH", "2500")) # trim references
+MAX_STYLE_SAMPLES_FETCH = int(os.getenv("MAX_STYLE_SAMPLES_FETCH", "200"))  # fetch embedded, then filter
 
 # Article fields (Airtable)
 CLIENT_LINK_FIELD = os.getenv("CLIENT_LINK_FIELD", "Client")  # link-to-record field on Articles
@@ -112,10 +120,22 @@ def require_env():
 require_env()
 
 # ==================================================
-# OPENAI CLIENT (proxy-safe)
+# LOGGING HELPERS
+# ==================================================
+def log(msg: str):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+# ==================================================
+# OPENAI CLIENT (proxy-safe) — increased read timeout
 # ==================================================
 http_client = httpx.Client(
-    timeout=httpx.Timeout(60.0, connect=20.0, read=60.0, write=60.0, pool=60.0),
+    timeout=httpx.Timeout(
+        180.0,   # total (fallback)
+        connect=20.0,
+        read=180.0,
+        write=60.0,
+        pool=60.0,
+    ),
     follow_redirects=True,
     trust_env=False,
 )
@@ -133,11 +153,11 @@ def airtable_table_url(table_name_or_id: str):
 
 def airtable_get_table(table_name_or_id: str, params: dict):
     url = airtable_table_url(table_name_or_id)
-    r = requests.get(url, headers=airtable_headers(), params=params, timeout=30)
+    r = requests.get(url, headers=airtable_headers(), params=params, timeout=AIRTABLE_HTTP_TIMEOUT)
     if r.status_code != 200:
-        print("Airtable GET URL:", r.url, flush=True)
-        print("Airtable GET status:", r.status_code, flush=True)
-        print("Airtable GET response:", r.text, flush=True)
+        log(f"Airtable GET URL: {r.url}")
+        log(f"Airtable GET status: {r.status_code}")
+        log(f"Airtable GET response: {r.text}")
         r.raise_for_status()
     return r.json()
 
@@ -146,31 +166,30 @@ def airtable_get(params: dict):
 
 def update_record(record_id: str, fields: dict):
     url = f"{airtable_table_url(AIRTABLE_TABLE)}/{record_id}"
-    r = requests.patch(url, headers=airtable_headers(), json={"fields": fields}, timeout=30)
+    r = requests.patch(url, headers=airtable_headers(), json={"fields": fields}, timeout=AIRTABLE_HTTP_TIMEOUT)
     if r.status_code != 200:
-        print("Airtable PATCH URL:", url, flush=True)
-        print("Airtable PATCH status:", r.status_code, flush=True)
-        print("Airtable PATCH response:", r.text, flush=True)
+        log(f"Airtable PATCH URL: {url}")
+        log(f"Airtable PATCH status: {r.status_code}")
+        log(f"Airtable PATCH response: {r.text}")
         r.raise_for_status()
     return r.json()
 
 def safe_patch_articles(record_id: str, fields: dict):
-    # Avoid crashing the whole record processing if patching a non-existent optional field
     try:
         update_record(record_id, fields)
     except Exception as e:
-        print("Non-fatal patch error:", str(e), flush=True)
+        log(f"Non-fatal patch error: {e}")
 
 def safe_mark_failed(record_id: str, msg: str):
     msg = (msg or "Unknown error")[:9000]
     try:
         update_record(record_id, {STATUS_FIELD: FAILED_VALUE, LAST_ERROR_FIELD: msg})
     except Exception as e:
-        print("Failed to mark failed:", str(e), flush=True)
+        log(f"Failed to mark failed: {e}")
         try:
             update_record(record_id, {STATUS_FIELD: FAILED_VALUE})
         except Exception as e2:
-            print("Failed even minimal mark failed:", str(e2), flush=True)
+            log(f"Failed even minimal mark failed: {e2}")
 
 def list_ready(max_records: int):
     formula = f'{{{STATUS_FIELD}}}="{READY_VALUE}"'
@@ -204,7 +223,7 @@ def embed_text(text: str):
 def get_client_record(client_record_id: str) -> dict:
     data = airtable_get_table(
         AIRTABLE_CLIENTS_TABLE,
-        {"maxRecords": 1, "filterByFormula": f'ReCORD_ID()="{client_record_id}"'},
+        {"maxRecords": 1, "filterByFormula": f'RECORD_ID()="{client_record_id}"'},
     )
     recs = data.get("records", [])
     if not recs:
@@ -223,7 +242,6 @@ def fetch_style_samples_for_client(client_record_id: str, max_records: int = 200
     Robust approach:
     - Airtable filter only on Embedding Status = Embedded
     - Filter by linked Client record_id in Python
-    This avoids ARRAYJOIN/FIND issues and handles link fields reliably.
     """
     formula = f'{{{STYLE_STATUS_FIELD}}}="{STYLE_STATUS_EMBEDDED}"'
     data = airtable_get_table(
@@ -269,7 +287,7 @@ def build_prompt(article_fields: dict, client_fields: dict, top_samples_scored: 
     topic = article_fields.get(TOPIC_FIELD_1) or article_fields.get(TOPIC_FIELD_2) or "Write an original article."
     word_count = article_fields.get("word count") or article_fields.get("Word Count") or 700
 
-    # IMPORTANT: we no longer use Tone / Special Content Instructions (safe to delete those fields)
+    # We no longer use Tone / Special Content Instructions (safe to delete those fields)
     style_rules = (client_fields.get(CLIENT_STYLE_RULES_FIELD) or "").strip()
     format_rules = (client_fields.get(CLIENT_FORMAT_RULES_FIELD) or "").strip()
     banned_phrases = _normalize_banned_phrases(client_fields.get(CLIENT_BANNED_PHRASES_FIELD))
@@ -346,7 +364,7 @@ def zerogpt_detect(text: str) -> dict:
     headers = {"Content-Type": "application/json", "ApiKey": ZEROGPT_API_KEY}
     payload = {"input_text": text}
 
-    r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=60)
+    r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=ZEROGPT_HTTP_TIMEOUT)
     raw = r.text
 
     try:
@@ -392,23 +410,26 @@ def process_one(record: dict):
         LAST_ERROR_FIELD: "",
         DRAFTING_STARTED_AT_FIELD: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
-    print("Setting Drafting:", record_id, flush=True)
+    log(f"Setting Drafting: {record_id}")
     update_record(record_id, drafting_patch)
     check_timeout("drafting_patch")
 
     # Debug: show config
-    print("Client record id from Article:", client_record_id, flush=True)
-    print("STYLE_CLIENT_LINK_FIELD:", STYLE_CLIENT_LINK_FIELD, flush=True)
-    print("STYLE_STATUS_FIELD:", STYLE_STATUS_FIELD, "=", STYLE_STATUS_EMBEDDED, flush=True)
+    log(f"Client record id from Article: {client_record_id}")
+    log(f"STYLE_CLIENT_LINK_FIELD: {STYLE_CLIENT_LINK_FIELD}")
+    log(f"STYLE_STATUS_FIELD: {STYLE_STATUS_FIELD} = {STYLE_STATUS_EMBEDDED}")
+    log(f"TOP_STYLE_SAMPLES: {TOP_STYLE_SAMPLES}, MAX_STYLE_CHARS_EACH: {MAX_STYLE_CHARS_EACH}")
 
     # Fetch client rules
+    log("Fetching client rules...")
     client_rec = get_client_record(client_record_id)
     client_fields = client_rec.get("fields", {}) or {}
     check_timeout("client_fetch")
 
-    # Fetch style samples (embedded + filtered by client in python)
+    # Fetch style samples
+    log("Fetching embedded style samples...")
     style_recs = fetch_style_samples_for_client(client_record_id, max_records=MAX_STYLE_SAMPLES_FETCH)
-    print("Embedded style samples matched:", len(style_recs), flush=True)
+    log(f"Embedded style samples matched: {len(style_recs)}")
     if not style_recs:
         raise RuntimeError(
             "No embedded style samples found for this client. "
@@ -417,35 +438,39 @@ def process_one(record: dict):
         )
     check_timeout("style_fetch")
 
-    # Embed a query for retrieval (use brief + topic)
+    # Embed query for retrieval (brief + topic)
     topic = fields.get(TOPIC_FIELD_1) or fields.get(TOPIC_FIELD_2) or ""
     brief = fields.get(BRIEF_FIELD) or fields.get("Instructions") or ""
-    query_text = (brief.strip() + "\n\n" + str(topic).strip()).strip() or "article brief"
-    print("Embedding query:", record_id, "len:", len(query_text), flush=True)
+    query_text = (str(brief).strip() + "\n\n" + str(topic).strip()).strip() or "article brief"
+    log(f"Embedding query (len={len(query_text)} chars)...")
     query_emb = embed_text(query_text[:8000])
     check_timeout("embed_query")
 
+    # Select top samples
     top_scored = select_top_style_samples(style_recs, query_emb, top_k=TOP_STYLE_SAMPLES)
     if not top_scored:
         raise RuntimeError("Could not score/select any style samples (missing vectors or invalid JSON).")
     check_timeout("select_top_samples")
 
+    # Build prompt
     prompt, used_titles_block = build_prompt(fields, client_fields, top_scored)
 
     # Optional: write debug field if present
     safe_patch_articles(record_id, {STYLE_SAMPLES_USED_FIELD: used_titles_block})
 
-    print("OpenAI start:", record_id, flush=True)
+    # Generate
+    log("OpenAI generation start...")
     article = generate_article(prompt)
-    print("OpenAI done:", record_id, "len:", len(article), flush=True)
+    log(f"OpenAI generation done (len={len(article)} chars).")
     check_timeout("openai_done")
 
     if not article or len(article) < 200:
         raise RuntimeError("Generated article too short.")
 
-    print("ZeroGPT start:", record_id, flush=True)
+    # ZeroGPT
+    log("ZeroGPT start...")
     qc = zerogpt_detect(article)
-    print("ZeroGPT done:", record_id, "qc_error:", qc.get("error"), "score:", qc.get("score"), flush=True)
+    log(f"ZeroGPT done (qc_error={qc.get('error')}, score={qc.get('score')}).")
     check_timeout("zerogpt_done")
 
     patch = {
@@ -473,43 +498,44 @@ def process_one(record: dict):
     else:
         patch[STATUS_FIELD] = DELIVERED_VALUE
 
-    print("Writing final status:", record_id, patch[STATUS_FIELD], flush=True)
+    log(f"Writing final status: {record_id} -> {patch[STATUS_FIELD]}")
     update_record(record_id, patch)
 
 # ==================================================
 # MAIN LOOP
 # ==================================================
 def main():
-    print("========================================", flush=True)
-    print("WORKER_VERSION:", WORKER_VERSION, flush=True)
-    print("BASE:", AIRTABLE_BASE_ID, flush=True)
-    print("ARTICLES TABLE:", AIRTABLE_TABLE, flush=True)
-    print("CLIENTS TABLE:", AIRTABLE_CLIENTS_TABLE, flush=True)
-    print("STYLE TABLE:", AIRTABLE_STYLE_TABLE, flush=True)
-    print("STATUS_FIELD:", STATUS_FIELD, "READY_VALUE:", READY_VALUE, flush=True)
-    print("POLL_SECONDS:", POLL_SECONDS, "MAX_RECORDS_PER_CYCLE:", MAX_RECORDS_PER_CYCLE, flush=True)
-    print("EMBED_MODEL:", EMBED_MODEL, "TOP_STYLE_SAMPLES:", TOP_STYLE_SAMPLES, flush=True)
-    print("ZeroGPT URL:", ZEROGPT_API_URL, flush=True)
-    print("ZeroGPT threshold (<):", ZEROGPT_THRESHOLD, flush=True)
-    print("========================================", flush=True)
+    log("========================================")
+    log(f"WORKER_VERSION: {WORKER_VERSION}")
+    log(f"BASE: {AIRTABLE_BASE_ID}")
+    log(f"ARTICLES TABLE: {AIRTABLE_TABLE}")
+    log(f"CLIENTS TABLE: {AIRTABLE_CLIENTS_TABLE}")
+    log(f"STYLE TABLE: {AIRTABLE_STYLE_TABLE}")
+    log(f"STATUS_FIELD: {STATUS_FIELD} READY_VALUE: {READY_VALUE}")
+    log(f"POLL_SECONDS: {POLL_SECONDS} MAX_RECORDS_PER_CYCLE: {MAX_RECORDS_PER_CYCLE}")
+    log(f"EMBED_MODEL: {EMBED_MODEL} TOP_STYLE_SAMPLES: {TOP_STYLE_SAMPLES} MAX_STYLE_CHARS_EACH: {MAX_STYLE_CHARS_EACH}")
+    log(f"AIRTABLE_HTTP_TIMEOUT: {AIRTABLE_HTTP_TIMEOUT} ZEROGPT_HTTP_TIMEOUT: {ZEROGPT_HTTP_TIMEOUT}")
+    log(f"ZeroGPT URL: {ZEROGPT_API_URL}")
+    log(f"ZeroGPT threshold (<): {ZEROGPT_THRESHOLD}")
+    log("========================================")
 
     while True:
         try:
-            print("Polling Airtable...", flush=True)
+            log("Polling Airtable...")
             ready = list_ready(MAX_RECORDS_PER_CYCLE)
-            print("Ready records found:", len(ready), flush=True)
+            log(f"Ready records found: {len(ready)}")
 
             for rec in ready:
                 rid = rec["id"]
                 try:
-                    print("Processing:", rid, flush=True)
+                    log(f"Processing: {rid}")
                     process_one(rec)
                 except Exception as e:
-                    print("FAILED:", rid, str(e), flush=True)
+                    log(f"FAILED: {rid} {e}")
                     safe_mark_failed(rid, str(e))
 
         except Exception as cycle_error:
-            print("Cycle error:", str(cycle_error), flush=True)
+            log(f"Cycle error: {cycle_error}")
 
         time.sleep(POLL_SECONDS)
 
