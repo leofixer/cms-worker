@@ -10,7 +10,7 @@ from openai import OpenAI
 # ==================================================
 # VERSION STAMP
 # ==================================================
-WORKER_VERSION = "v7-watchdog-stuck-recovery-2026-02-23"
+WORKER_VERSION = "v8-zerogpt-docs-apikey-inputtext-2026-02-24"
 
 # ==================================================
 # REQUIRED ENV VARS
@@ -38,14 +38,19 @@ LAST_ERROR_FIELD = os.getenv("LAST_ERROR_FIELD", "Last Error")
 # Optional timestamp field in Airtable (recommended)
 DRAFTING_STARTED_AT_FIELD = os.getenv("DRAFTING_STARTED_AT_FIELD", "Drafting Started At")
 
-# Record-level watchdog (prevents infinite hangs)
+# Prevent infinite hangs per record
 RECORD_TIMEOUT_SECONDS = int(os.getenv("RECORD_TIMEOUT_SECONDS", "240"))  # 4 minutes
 
-# Auto-fail stuck Drafting records (optional)
-STUCK_MINUTES = int(os.getenv("STUCK_MINUTES", "15"))  # if Drafting older than 15 min -> Failed
+# Auto-fail Drafting if older than this (minutes). Set 0 to disable.
+STUCK_MINUTES = int(os.getenv("STUCK_MINUTES", "15"))
 
 # ==================================================
-# ZeroGPT (QC signal)
+# ZeroGPT (per your uploaded docs)
+# Base URL: https://api.zerogpt.com
+# Endpoint: POST /api/detect/detectText
+# Header: ApiKey: <key>
+# Body: { "input_text": "..." }
+# Response: data.fakePercentage is the AI% (per docs)
 # ==================================================
 ZEROGPT_API_KEY = os.getenv("ZEROGPT_API_KEY")
 ZEROGPT_API_URL = os.getenv("ZEROGPT_API_URL", "https://api.zerogpt.com/api/detect/detectText")
@@ -75,9 +80,8 @@ def require_env():
 require_env()
 
 # ==================================================
-# CLIENTS
+# OPENAI CLIENT (proxy-safe)
 # ==================================================
-# OpenAI client (proxy-safe, with explicit timeouts)
 http_client = httpx.Client(
     timeout=httpx.Timeout(60.0, connect=20.0, read=60.0, write=60.0, pool=60.0),
     follow_redirects=True,
@@ -121,17 +125,13 @@ def update_record(record_id: str, fields: dict):
 
 
 def safe_mark_failed(record_id: str, msg: str):
-    """Always try to write a failure. If Last Error field causes issues, retry with minimal fields."""
     msg = (msg or "Unknown error")[:9000]
-
-    # Attempt 1: full failure update
     try:
         update_record(record_id, {STATUS_FIELD: FAILED_VALUE, LAST_ERROR_FIELD: msg})
         return
     except Exception as e1:
         print("Failed to write full failure update:", str(e1), flush=True)
 
-    # Attempt 2: minimal failure update (Status only)
     try:
         update_record(record_id, {STATUS_FIELD: FAILED_VALUE})
         return
@@ -146,12 +146,7 @@ def list_ready(max_records: int):
     return data.get("records", [])
 
 
-def list_stuck_drafting(max_records: int):
-    """
-    If you have a date field Drafting Started At, this can find old Drafting records.
-    Airtable formula uses IS_BEFORE() with DATETIME_PARSE for relative time.
-    We do a simpler approach: fetch Drafting and let python decide if field exists.
-    """
+def list_drafting(max_records: int):
     filter_formula = f'{{{STATUS_FIELD}}}="{DRAFTING_VALUE}"'
     params = {"maxRecords": max_records, "filterByFormula": filter_formula}
     data = airtable_get(params)
@@ -169,6 +164,7 @@ def build_prompt(fields: dict) -> str:
 
     anchor = fields.get("Anchor Text")
     target_url = fields.get("Target URL")
+
     link_rule = ""
     if anchor and target_url:
         link_rule = f'Include this exact anchor text once: "{anchor}" linking to {target_url}. Make it natural.'
@@ -213,14 +209,19 @@ def generate_article(prompt: str) -> str:
 
 
 # ==================================================
-# ZeroGPT QC
+# ZeroGPT DETECTION (matches your ZeroGPT docs)
 # ==================================================
 def zerogpt_detect(text: str) -> dict:
     if not ZEROGPT_API_KEY:
         return {"enabled": False, "reason": "ZEROGPT_API_KEY not set"}
 
-    headers = {"Content-Type": "application/json", "x-api-key": ZEROGPT_API_KEY}
-    payload = {"text": text}
+    headers = {
+        "Content-Type": "application/json",
+        "ApiKey": ZEROGPT_API_KEY,          # <-- per docs
+    }
+    payload = {
+        "input_text": text                 # <-- per docs
+    }
 
     r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=60)
     raw = r.text
@@ -228,40 +229,39 @@ def zerogpt_detect(text: str) -> dict:
     try:
         data = r.json()
     except Exception:
-        return {"enabled": True, "error": True, "http_status": r.status_code, "raw": raw[:20000]}
+        return {
+            "enabled": True,
+            "error": True,
+            "http_status": r.status_code,
+            "raw": raw[:20000],
+        }
 
     # Treat success:false as error (even if HTTP 200)
     if isinstance(data, dict) and data.get("success") is False:
-        return {"enabled": True, "error": True, "http_status": r.status_code, "raw_json": data}
+        return {
+            "enabled": True,
+            "error": True,
+            "http_status": data.get("code", r.status_code),
+            "raw_json": data,
+        }
 
-    # Score extraction: may differ by account; store raw always
+    # Extract score per docs: data.fakePercentage
     score = None
-    if isinstance(data, dict):
-        for k in ["aiPercentage", "ai_percentage", "aiScore", "ai_score"]:
-            if k in data:
-                try:
-                    v = data[k]
-                    if isinstance(v, str):
-                        v = v.strip().replace("%", "")
-                    score = float(v)
-                    break
-                except Exception:
-                    pass
+    try:
+        if isinstance(data, dict):
+            d = data.get("data")
+            if isinstance(d, dict) and "fakePercentage" in d:
+                v = str(d["fakePercentage"]).strip().replace("%", "")
+                score = float(v)
+    except Exception:
+        score = None
 
-        # Some APIs nest into data
-        if score is None and isinstance(data.get("data"), dict):
-            for k in ["aiPercentage", "ai_percentage", "aiScore", "ai_score"]:
-                if k in data["data"]:
-                    try:
-                        v = data["data"][k]
-                        if isinstance(v, str):
-                            v = v.strip().replace("%", "")
-                        score = float(v)
-                        break
-                    except Exception:
-                        pass
-
-    return {"enabled": True, "error": False, "score": score, "raw_json": data}
+    return {
+        "enabled": True,
+        "error": False,
+        "score": score,
+        "raw_json": data,
+    }
 
 
 # ==================================================
@@ -278,13 +278,14 @@ def process_one(record: dict):
             raise TimeoutError(f"Record timed out after {RECORD_TIMEOUT_SECONDS}s during: {step_name}")
 
     # Mark Drafting + timestamp
-    patch = {STATUS_FIELD: DRAFTING_VALUE, LAST_ERROR_FIELD: ""}
-    # If the timestamp field exists, write to it (Airtable accepts ISO strings)
-    patch[DRAFTING_STARTED_AT_FIELD] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    drafting_patch = {
+        STATUS_FIELD: DRAFTING_VALUE,
+        LAST_ERROR_FIELD: "",
+        DRAFTING_STARTED_AT_FIELD: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
 
     print("Setting Drafting:", record_id, flush=True)
-    update_record(record_id, patch)
-
+    update_record(record_id, drafting_patch)
     check_timeout("after drafting patch")
 
     prompt = build_prompt(fields)
@@ -292,13 +293,11 @@ def process_one(record: dict):
     print("OpenAI start:", record_id, flush=True)
     article = generate_article(prompt)
     print("OpenAI done:", record_id, "len:", len(article), flush=True)
-
     check_timeout("after OpenAI")
 
     if not article or len(article) < 200:
         raise RuntimeError("Generated article too short.")
 
-    # ZeroGPT QC
     qc = {}
     if ZEROGPT_API_KEY:
         print("ZeroGPT start:", record_id, flush=True)
@@ -306,23 +305,63 @@ def process_one(record: dict):
         print("ZeroGPT done:", record_id, "qc_error:", qc.get("error"), "score:", qc.get("score"), flush=True)
         check_timeout("after ZeroGPT")
 
-    # Build final patch
-    final_patch = {FINAL_TEXT_FIELD: article, STATUS_FIELD: DELIVERED_VALUE}
+    # Final patch
+    final_patch = {
+        FINAL_TEXT_FIELD: article,
+        STATUS_FIELD: DELIVERED_VALUE,
+    }
 
     if qc:
         final_patch[AI_RAW_FIELD] = json.dumps(qc, ensure_ascii=False)
+
         if qc.get("error"):
             final_patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
         else:
             score = qc.get("score")
             if score is not None:
                 final_patch[AI_SCORE_FIELD] = float(score)
-                final_patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS if float(score) > ZEROGPT_THRESHOLD else REVIEW_APPROVED
+                final_patch[REVIEW_STATUS_FIELD] = (
+                    REVIEW_NEEDS if float(score) > ZEROGPT_THRESHOLD else REVIEW_APPROVED
+                )
             else:
                 final_patch[REVIEW_STATUS_FIELD] = REVIEW_NEEDS
 
     print("Writing Delivered:", record_id, flush=True)
     update_record(record_id, final_patch)
+
+
+# ==================================================
+# STUCK DRAFTING RECOVERY (OPTIONAL)
+# ==================================================
+def stuck_recovery():
+    if STUCK_MINUTES <= 0:
+        return
+
+    try:
+        drafting = list_drafting(10)
+    except Exception as e:
+        print("Stuck recovery: failed to list drafting:", str(e), flush=True)
+        return
+
+    now = time.time()
+    for rec in drafting:
+        rid = rec["id"]
+        f = rec.get("fields", {})
+        started = f.get(DRAFTING_STARTED_AT_FIELD)
+        if not started:
+            continue
+
+        # Airtable may return e.g. 2026-02-24T09:12:30.000Z
+        ts = started.replace(".000Z", "Z")
+
+        try:
+            t_struct = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+            started_epoch = time.mktime(t_struct)  # local; good enough for stuck detection
+            age_min = (now - started_epoch) / 60.0
+            if age_min >= STUCK_MINUTES:
+                safe_mark_failed(rid, f"Stuck in Drafting for {int(age_min)} minutes. Auto-failed.")
+        except Exception:
+            continue
 
 
 # ==================================================
@@ -336,38 +375,13 @@ def main():
     print("STATUS_FIELD:", STATUS_FIELD, "READY_VALUE:", READY_VALUE, flush=True)
     print("POLL_SECONDS:", POLL_SECONDS, "MAX_RECORDS_PER_CYCLE:", MAX_RECORDS_PER_CYCLE, flush=True)
     print("RECORD_TIMEOUT_SECONDS:", RECORD_TIMEOUT_SECONDS, flush=True)
+    print("ZeroGPT URL:", ZEROGPT_API_URL, flush=True)
     print("ZeroGPT enabled:", bool(ZEROGPT_API_KEY), flush=True)
-    if ZEROGPT_API_KEY:
-        print("ZeroGPT URL:", ZEROGPT_API_URL, flush=True)
     print("========================================", flush=True)
 
     while True:
         try:
-            # Optional stuck recovery pass
-            if STUCK_MINUTES > 0:
-                try:
-                    drafting = list_stuck_drafting(10)
-                    now = time.time()
-                    for rec in drafting:
-                        rid = rec["id"]
-                        f = rec.get("fields", {})
-                        started = f.get(DRAFTING_STARTED_AT_FIELD)
-                        # If field missing or empty, we can’t evaluate
-                        if not started:
-                            continue
-                        # started is ISO; parse roughly without external libs
-                        # Example: 2026-02-23T10:20:30.000Z or 2026-02-23T10:20:30Z
-                        try:
-                            ts = started.replace(".000Z", "Z")
-                            t_struct = time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
-                            started_epoch = time.mktime(t_struct)  # local; acceptable for rough stuck detection
-                            age_minutes = (now - started_epoch) / 60.0
-                            if age_minutes >= STUCK_MINUTES:
-                                safe_mark_failed(rid, f"Stuck in Drafting for {int(age_minutes)} minutes. Auto-failed.")
-                        except Exception:
-                            pass
-                except Exception as e:
-                    print("Stuck recovery error:", str(e), flush=True)
+            stuck_recovery()
 
             print("Polling Airtable...", flush=True)
             ready = list_ready(MAX_RECORDS_PER_CYCLE)
