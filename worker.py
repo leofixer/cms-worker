@@ -11,7 +11,7 @@ from openai import OpenAI
 # ==================================================
 # VERSION
 # ==================================================
-WORKER_VERSION = "v10-gen+ragsamples+qc-under15-needsreview-2026-02-24"
+WORKER_VERSION = "v10.1-gen+ragsamples(pyfilter)+qc-under15-needsreview-2026-02-24"
 
 # ==================================================
 # REQUIRED ENV VARS (Render)
@@ -22,7 +22,7 @@ AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")  # Articles table (tblXXXXXXXX reco
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ==================================================
-# NEW REQUIRED ENV VARS (for style RAG)
+# REQUIRED ENV VARS (for style RAG)
 # ==================================================
 AIRTABLE_CLIENTS_TABLE = os.getenv("AIRTABLE_CLIENTS_TABLE")  # Clients table id/name
 AIRTABLE_STYLE_TABLE = os.getenv("AIRTABLE_STYLE_TABLE")      # Client Style Library table id/name
@@ -65,10 +65,16 @@ AI_RAW_FIELD = os.getenv("AI_RAW_FIELD", "AI Raw Response")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
 TOP_STYLE_SAMPLES = int(os.getenv("TOP_STYLE_SAMPLES", "3"))  # recommend 3 (max 5)
 MAX_STYLE_CHARS_EACH = int(os.getenv("MAX_STYLE_CHARS_EACH", "6000"))  # trim references
-MAX_STYLE_SAMPLES_FETCH = int(os.getenv("MAX_STYLE_SAMPLES_FETCH", "50"))  # fetch up to N per client
+MAX_STYLE_SAMPLES_FETCH = int(os.getenv("MAX_STYLE_SAMPLES_FETCH", "200"))  # fetch up to N embedded, then filter
 
 # Article fields (Airtable)
 CLIENT_LINK_FIELD = os.getenv("CLIENT_LINK_FIELD", "Client")  # link-to-record field on Articles
+BRIEF_FIELD = os.getenv("BRIEF_FIELD", "Brief")
+TOPIC_FIELD_1 = os.getenv("TOPIC_FIELD_1", "Topics")
+TOPIC_FIELD_2 = os.getenv("TOPIC_FIELD_2", "Topic")
+
+# Optional debug field on Articles (create it if you want)
+STYLE_SAMPLES_USED_FIELD = os.getenv("STYLE_SAMPLES_USED_FIELD", "Style Samples Used")
 
 # Clients table fields
 CLIENT_STYLE_RULES_FIELD = os.getenv("CLIENT_STYLE_RULES_FIELD", "Style Rules")
@@ -81,9 +87,11 @@ STYLE_TEXT_FIELD = os.getenv("STYLE_TEXT_FIELD", "Chunk Text")
 STYLE_VECTOR_FIELD = os.getenv("STYLE_VECTOR_FIELD", "Embedding Vector")
 STYLE_STATUS_FIELD = os.getenv("STYLE_STATUS_FIELD", "Embedding Status")
 STYLE_STATUS_EMBEDDED = os.getenv("STYLE_STATUS_EMBEDDED", "Embedded")
-STYLE_SAMPLE_TITLE_FIELD = os.getenv("STYLE_SAMPLE_TITLE_FIELD", "Sample Title")  # primary field or any title field
+STYLE_SAMPLE_TITLE_FIELD = os.getenv("STYLE_SAMPLE_TITLE_FIELD", "Sample Title")  # primary or title
 
-
+# ==================================================
+# ENV CHECK
+# ==================================================
 def require_env():
     missing = []
     required = {
@@ -101,7 +109,6 @@ def require_env():
     if missing:
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
-
 require_env()
 
 # ==================================================
@@ -114,18 +121,15 @@ http_client = httpx.Client(
 )
 client = OpenAI(api_key=OPENAI_API_KEY, http_client=http_client)
 
-
 # ==================================================
 # AIRTABLE HELPERS
 # ==================================================
 def airtable_headers():
     return {"Authorization": f"Bearer {AIRTABLE_TOKEN}", "Content-Type": "application/json"}
 
-
 def airtable_table_url(table_name_or_id: str):
     table = quote(table_name_or_id, safe="")
     return f"https://api.airtable.com/v0/{AIRTABLE_BASE_ID}/{table}"
-
 
 def airtable_get_table(table_name_or_id: str, params: dict):
     url = airtable_table_url(table_name_or_id)
@@ -137,14 +141,10 @@ def airtable_get_table(table_name_or_id: str, params: dict):
         r.raise_for_status()
     return r.json()
 
-
 def airtable_get(params: dict):
-    # Articles table
     return airtable_get_table(AIRTABLE_TABLE, params)
 
-
 def update_record(record_id: str, fields: dict):
-    # Articles table update
     url = f"{airtable_table_url(AIRTABLE_TABLE)}/{record_id}"
     r = requests.patch(url, headers=airtable_headers(), json={"fields": fields}, timeout=30)
     if r.status_code != 200:
@@ -154,17 +154,12 @@ def update_record(record_id: str, fields: dict):
         r.raise_for_status()
     return r.json()
 
-
-def update_record_in_table(table_name_or_id: str, record_id: str, fields: dict):
-    url = f"{airtable_table_url(table_name_or_id)}/{record_id}"
-    r = requests.patch(url, headers=airtable_headers(), json={"fields": fields}, timeout=30)
-    if r.status_code != 200:
-        print("Airtable PATCH URL:", url, flush=True)
-        print("Airtable PATCH status:", r.status_code, flush=True)
-        print("Airtable PATCH response:", r.text, flush=True)
-        r.raise_for_status()
-    return r.json()
-
+def safe_patch_articles(record_id: str, fields: dict):
+    # Avoid crashing the whole record processing if patching a non-existent optional field
+    try:
+        update_record(record_id, fields)
+    except Exception as e:
+        print("Non-fatal patch error:", str(e), flush=True)
 
 def safe_mark_failed(record_id: str, msg: str):
     msg = (msg or "Unknown error")[:9000]
@@ -177,18 +172,15 @@ def safe_mark_failed(record_id: str, msg: str):
         except Exception as e2:
             print("Failed even minimal mark failed:", str(e2), flush=True)
 
-
 def list_ready(max_records: int):
     formula = f'{{{STATUS_FIELD}}}="{READY_VALUE}"'
     data = airtable_get({"maxRecords": max_records, "filterByFormula": formula})
     return data.get("records", [])
 
-
 # ==================================================
 # RAG STYLE HELPERS
 # ==================================================
 def cosine_similarity(vec1, vec2) -> float:
-    # defensive: different lengths should not happen, but avoid crash
     n = min(len(vec1), len(vec2))
     if n == 0:
         return 0.0
@@ -205,53 +197,51 @@ def cosine_similarity(vec1, vec2) -> float:
         return 0.0
     return dot / (math.sqrt(norm1) * math.sqrt(norm2))
 
-
 def embed_text(text: str):
-    # embeddings via OpenAI API (using the OpenAI python client for consistency)
     resp = client.embeddings.create(model=EMBED_MODEL, input=text)
     return resp.data[0].embedding
 
-
 def get_client_record(client_record_id: str) -> dict:
-    data = airtable_get_table(AIRTABLE_CLIENTS_TABLE, {"maxRecords": 1, "filterByFormula": f'RECORD_ID()="{client_record_id}"'})
+    data = airtable_get_table(
+        AIRTABLE_CLIENTS_TABLE,
+        {"maxRecords": 1, "filterByFormula": f'ReCORD_ID()="{client_record_id}"'},
+    )
     recs = data.get("records", [])
     if not recs:
         raise RuntimeError(f"Client record not found: {client_record_id}")
     return recs[0]
 
-
 def _normalize_banned_phrases(v):
     if not v:
         return ""
-    # could be a string with lines, or list (multi-select)
     if isinstance(v, list):
-        # Airtable multi-select returns list of strings
         return "\n".join([str(x) for x in v if str(x).strip()])
     return str(v).strip()
 
-
-def fetch_style_samples_for_client(client_record_id: str, max_records: int = 50):
-    # Only embedded samples for that client
-    # Airtable formula: AND({Client}='rec...', {Embedding Status}='Embedded')
-    # Link-to-record fields typically store an array of record IDs.
-    # In formulas, you can use FIND("recXXXX", ARRAYJOIN({Client})) > 0
-    formula = (
-        f'AND('
-        f'FIND("{client_record_id}", ARRAYJOIN({{{STYLE_CLIENT_LINK_FIELD}}}))>0,'
-        f'{{{STYLE_STATUS_FIELD}}}="{STYLE_STATUS_EMBEDDED}"'
-        f')'
-    )
+def fetch_style_samples_for_client(client_record_id: str, max_records: int = 200):
+    """
+    Robust approach:
+    - Airtable filter only on Embedding Status = Embedded
+    - Filter by linked Client record_id in Python
+    This avoids ARRAYJOIN/FIND issues and handles link fields reliably.
+    """
+    formula = f'{{{STYLE_STATUS_FIELD}}}="{STYLE_STATUS_EMBEDDED}"'
     data = airtable_get_table(
         AIRTABLE_STYLE_TABLE,
         {
             "maxRecords": max_records,
             "filterByFormula": formula,
-            # minimize payload
-            "fields[]": [STYLE_TEXT_FIELD, STYLE_VECTOR_FIELD, STYLE_SAMPLE_TITLE_FIELD],
+            "fields[]": [STYLE_TEXT_FIELD, STYLE_VECTOR_FIELD, STYLE_SAMPLE_TITLE_FIELD, STYLE_CLIENT_LINK_FIELD],
         },
     )
-    return data.get("records", [])
-
+    recs = data.get("records", [])
+    matched = []
+    for r in recs:
+        f = r.get("fields", {}) or {}
+        linked = f.get(STYLE_CLIENT_LINK_FIELD)
+        if isinstance(linked, list) and client_record_id in linked:
+            matched.append(r)
+    return matched
 
 def select_top_style_samples(style_records: list, query_embedding: list, top_k: int):
     scored = []
@@ -269,39 +259,34 @@ def select_top_style_samples(style_records: list, query_embedding: list, top_k: 
             scored.append((score, rec))
         except Exception:
             continue
-
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
-
 
 # ==================================================
 # CONTENT GENERATION (with style RAG)
 # ==================================================
-def build_prompt(fields: dict, client_fields: dict, top_samples_scored: list) -> str:
-    topic = fields.get("Topics") or fields.get("Topic") or "Write an original article."
-    word_count = fields.get("word count") or fields.get("Word Count") or 700
+def build_prompt(article_fields: dict, client_fields: dict, top_samples_scored: list):
+    topic = article_fields.get(TOPIC_FIELD_1) or article_fields.get(TOPIC_FIELD_2) or "Write an original article."
+    word_count = article_fields.get("word count") or article_fields.get("Word Count") or 700
 
-    # IMPORTANT: stop using Tone / Special Content Instructions (you said you want to delete them)
-    # tone = fields.get("Tone") or ""
-    # special = fields.get("Special Content Instructions") or ""
-
+    # IMPORTANT: we no longer use Tone / Special Content Instructions (safe to delete those fields)
     style_rules = (client_fields.get(CLIENT_STYLE_RULES_FIELD) or "").strip()
     format_rules = (client_fields.get(CLIENT_FORMAT_RULES_FIELD) or "").strip()
     banned_phrases = _normalize_banned_phrases(client_fields.get(CLIENT_BANNED_PHRASES_FIELD))
 
-    anchor = fields.get("Anchor Text")
-    target_url = fields.get("Target URL")
+    anchor = article_fields.get("Anchor Text")
+    target_url = article_fields.get("Target URL")
     link_rule = ""
     if anchor and target_url:
         link_rule = f'Include this exact anchor text once: "{anchor}" linking to {target_url}. Make it natural.'
 
-    # Build style references block
     refs_lines = []
     used_titles = []
     for idx, (score, rec) in enumerate(top_samples_scored, start=1):
         sf = rec.get("fields", {}) or {}
         title = sf.get(STYLE_SAMPLE_TITLE_FIELD) or rec.get("id")
         used_titles.append(f"{idx}. {title} (score={score:.4f})")
+
         sample_text = (sf.get(STYLE_TEXT_FIELD) or "").strip()
         if len(sample_text) > MAX_STYLE_CHARS_EACH:
             sample_text = sample_text[:MAX_STYLE_CHARS_EACH].rstrip() + "\n[...trimmed]"
@@ -310,8 +295,6 @@ def build_prompt(fields: dict, client_fields: dict, top_samples_scored: list) ->
     style_refs_block = "\n\n".join(refs_lines).strip()
     used_titles_block = "\n".join(used_titles).strip()
 
-    # Save debug info back to Airtable (optional fields, safe if they don't exist)
-    # We'll return it so caller can patch it.
     prompt = f"""
 Write an original article.
 
@@ -346,9 +329,7 @@ Formatting rules (global):
 
     return prompt, used_titles_block
 
-
 def generate_article(prompt: str) -> str:
-    # gpt-5: defaults only (no temperature)
     resp = client.chat.completions.create(
         model="gpt-5",
         messages=[
@@ -358,16 +339,12 @@ def generate_article(prompt: str) -> str:
     )
     return (resp.choices[0].message.content or "").strip()
 
-
 # ==================================================
 # ZeroGPT DETECTION (correct request format)
 # ==================================================
 def zerogpt_detect(text: str) -> dict:
-    headers = {
-        "Content-Type": "application/json",
-        "ApiKey": ZEROGPT_API_KEY,  # per docs
-    }
-    payload = {"input_text": text}  # per docs
+    headers = {"Content-Type": "application/json", "ApiKey": ZEROGPT_API_KEY}
+    payload = {"input_text": text}
 
     r = requests.post(ZEROGPT_API_URL, headers=headers, json=payload, timeout=60)
     raw = r.text
@@ -377,11 +354,9 @@ def zerogpt_detect(text: str) -> dict:
     except Exception:
         return {"enabled": True, "error": True, "http_status": r.status_code, "raw": raw[:20000]}
 
-    # API uses success boolean in JSON
     if isinstance(data, dict) and data.get("success") is False:
         return {"enabled": True, "error": True, "http_status": data.get("code", r.status_code), "raw_json": data}
 
-    # score = fakePercentage (AI-likelihood %)
     score = None
     try:
         d = data.get("data") if isinstance(data, dict) else None
@@ -393,14 +368,12 @@ def zerogpt_detect(text: str) -> dict:
 
     return {"enabled": True, "error": False, "score": score, "raw_json": data}
 
-
 # ==================================================
 # PROCESS ONE RECORD
 # ==================================================
 def process_one(record: dict):
     record_id = record["id"]
     fields = record.get("fields", {})
-
     start = time.time()
 
     def check_timeout(step: str):
@@ -411,7 +384,6 @@ def process_one(record: dict):
     client_link = fields.get(CLIENT_LINK_FIELD)
     if not isinstance(client_link, list) or not client_link:
         raise RuntimeError(f'Missing linked Client in field "{CLIENT_LINK_FIELD}".')
-
     client_record_id = client_link[0]
 
     # set Drafting + timestamp
@@ -424,25 +396,33 @@ def process_one(record: dict):
     update_record(record_id, drafting_patch)
     check_timeout("drafting_patch")
 
+    # Debug: show config
+    print("Client record id from Article:", client_record_id, flush=True)
+    print("STYLE_CLIENT_LINK_FIELD:", STYLE_CLIENT_LINK_FIELD, flush=True)
+    print("STYLE_STATUS_FIELD:", STYLE_STATUS_FIELD, "=", STYLE_STATUS_EMBEDDED, flush=True)
+
     # Fetch client rules
     client_rec = get_client_record(client_record_id)
     client_fields = client_rec.get("fields", {}) or {}
     check_timeout("client_fetch")
 
-    # Fetch style samples (embedded only)
+    # Fetch style samples (embedded + filtered by client in python)
     style_recs = fetch_style_samples_for_client(client_record_id, max_records=MAX_STYLE_SAMPLES_FETCH)
+    print("Embedded style samples matched:", len(style_recs), flush=True)
     if not style_recs:
-        # Not fatal, but you won't get RAG style; mark Needs Review so you notice
-        # (If you'd rather proceed normally, change this to a warning and continue.)
-        raise RuntimeError("No embedded style samples found for this client. (Client Style Library filter returned 0.)")
+        raise RuntimeError(
+            "No embedded style samples found for this client. "
+            "Check that Style Library rows are linked to the same Client record as the Article, "
+            "and that Embedding Status is exactly 'Embedded'."
+        )
     check_timeout("style_fetch")
 
-    # Embed a query for retrieval (use topic/brief)
-    topic = fields.get("Topics") or fields.get("Topic") or ""
-    brief = fields.get("Brief") or fields.get("Instructions") or ""
-    query_text = (brief.strip() + "\n\n" + topic.strip()).strip() or "article brief"
+    # Embed a query for retrieval (use brief + topic)
+    topic = fields.get(TOPIC_FIELD_1) or fields.get(TOPIC_FIELD_2) or ""
+    brief = fields.get(BRIEF_FIELD) or fields.get("Instructions") or ""
+    query_text = (brief.strip() + "\n\n" + str(topic).strip()).strip() or "article brief"
     print("Embedding query:", record_id, "len:", len(query_text), flush=True)
-    query_emb = embed_text(query_text[:8000])  # keep it reasonable
+    query_emb = embed_text(query_text[:8000])
     check_timeout("embed_query")
 
     top_scored = select_top_style_samples(style_recs, query_emb, top_k=TOP_STYLE_SAMPLES)
@@ -452,12 +432,8 @@ def process_one(record: dict):
 
     prompt, used_titles_block = build_prompt(fields, client_fields, top_scored)
 
-    # Optional: write debug fields if they exist in Airtable (safe to try)
-    # Add these fields in Articles if you want: "Style Samples Used"
-    try:
-        update_record(record_id, {"Style Samples Used": used_titles_block})
-    except Exception:
-        pass
+    # Optional: write debug field if present
+    safe_patch_articles(record_id, {STYLE_SAMPLES_USED_FIELD: used_titles_block})
 
     print("OpenAI start:", record_id, flush=True)
     article = generate_article(prompt)
@@ -472,14 +448,12 @@ def process_one(record: dict):
     print("ZeroGPT done:", record_id, "qc_error:", qc.get("error"), "score:", qc.get("score"), flush=True)
     check_timeout("zerogpt_done")
 
-    # Always store raw response + article
     patch = {
         FINAL_TEXT_FIELD: article,
         AI_RAW_FIELD: json.dumps(qc, ensure_ascii=False),
     }
 
     if qc.get("error"):
-        # Detector error → Needs Review (do not deliver)
         patch[STATUS_FIELD] = NEEDS_REVIEW_VALUE
         patch[LAST_ERROR_FIELD] = f"ZeroGPT error: {qc.get('http_status')}"
         update_record(record_id, patch)
@@ -494,7 +468,6 @@ def process_one(record: dict):
 
     patch[AI_SCORE_FIELD] = float(score)
 
-    # RULE: MUST be under 15 to be acceptable
     if float(score) >= ZEROGPT_THRESHOLD:
         patch[STATUS_FIELD] = NEEDS_REVIEW_VALUE
     else:
@@ -502,7 +475,6 @@ def process_one(record: dict):
 
     print("Writing final status:", record_id, patch[STATUS_FIELD], flush=True)
     update_record(record_id, patch)
-
 
 # ==================================================
 # MAIN LOOP
@@ -540,7 +512,6 @@ def main():
             print("Cycle error:", str(cycle_error), flush=True)
 
         time.sleep(POLL_SECONDS)
-
 
 if __name__ == "__main__":
     main()
