@@ -11,14 +11,14 @@ from openai import OpenAI
 # ==================================================
 # VERSION
 # ==================================================
-WORKER_VERSION = "v10.2-gen+ragsamples(pyfilter)+timeouts+qc-under15-needsreview-2026-02-24"
+WORKER_VERSION = "v11.0-rag+polishpass+qc-routing+1retry+responsesapi-2026-02-25"
 
 # ==================================================
 # REQUIRED ENV VARS (Render)
 # ==================================================
 AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN")  # Airtable Personal Access Token
 AIRTABLE_BASE_ID = os.getenv("AIRTABLE_BASE_ID")
-AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")  # Articles table (tblXXXXXXXX recommended)
+AIRTABLE_TABLE = os.getenv("AIRTABLE_TABLE")  # Articles table (name or tblXXXXXXXX)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # ==================================================
@@ -26,6 +26,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # ==================================================
 AIRTABLE_CLIENTS_TABLE = os.getenv("AIRTABLE_CLIENTS_TABLE")  # Clients table id/name
 AIRTABLE_STYLE_TABLE = os.getenv("AIRTABLE_STYLE_TABLE")      # Client Style Library table id/name
+
+# ==================================================
+# ZeroGPT
+# ==================================================
+ZEROGPT_API_KEY = os.getenv("ZEROGPT_API_KEY")
+ZEROGPT_API_URL = os.getenv("ZEROGPT_API_URL", "https://api.zerogpt.com/api/detect/detectText")
+ZEROGPT_THRESHOLD = float(os.getenv("ZEROGPT_THRESHOLD", "15"))  # routing threshold
 
 # ==================================================
 # OPTIONAL ENV VARS
@@ -39,12 +46,20 @@ DRAFTING_VALUE = os.getenv("DRAFTING_VALUE", "Drafting")
 DELIVERED_VALUE = os.getenv("DELIVERED_VALUE", "Delivered")
 FAILED_VALUE = os.getenv("FAILED_VALUE", "Failed")
 NEEDS_REVIEW_VALUE = os.getenv("NEEDS_REVIEW_VALUE", "Needs Review")
+HUMAN_EDIT_VALUE = os.getenv("HUMAN_EDIT_VALUE", "Human Edit")  # new
 
 FINAL_TEXT_FIELD = os.getenv("FINAL_TEXT_FIELD", "Final Article Text")
 LAST_ERROR_FIELD = os.getenv("LAST_ERROR_FIELD", "Last Error")
 
 # optional timestamp field (recommended)
 DRAFTING_STARTED_AT_FIELD = os.getenv("DRAFTING_STARTED_AT_FIELD", "Drafting Started At")
+
+# QC fields
+AI_SCORE_FIELD = os.getenv("AI_SCORE_FIELD", "AI Score")
+AI_RAW_FIELD = os.getenv("AI_RAW_FIELD", "AI Raw Response")
+QC_ATTEMPTS_FIELD = os.getenv("QC_ATTEMPTS_FIELD", "QC Attempts")  # Number
+QC_NOTES_FIELD = os.getenv("QC_NOTES_FIELD", "QC Notes")            # Long text
+HUMAN_EDIT_REQUIRED_FIELD = os.getenv("HUMAN_EDIT_REQUIRED_FIELD", "Human Edit Required")  # Checkbox
 
 # record watchdog (increase to avoid false failures when generation is slow)
 RECORD_TIMEOUT_SECONDS = int(os.getenv("RECORD_TIMEOUT_SECONDS", "600"))  # 10 min default
@@ -56,24 +71,12 @@ AIRTABLE_HTTP_TIMEOUT = int(os.getenv("AIRTABLE_HTTP_TIMEOUT", "60"))
 ZEROGPT_HTTP_TIMEOUT = int(os.getenv("ZEROGPT_HTTP_TIMEOUT", "90"))
 
 # ==================================================
-# ZeroGPT (per your docs)
-# ==================================================
-ZEROGPT_API_KEY = os.getenv("ZEROGPT_API_KEY")
-ZEROGPT_API_URL = os.getenv("ZEROGPT_API_URL", "https://api.zerogpt.com/api/detect/detectText")
-ZEROGPT_THRESHOLD = float(os.getenv("ZEROGPT_THRESHOLD", "15"))  # must be < 15 to deliver
-
-AI_SCORE_FIELD = os.getenv("AI_SCORE_FIELD", "AI Score")
-AI_RAW_FIELD = os.getenv("AI_RAW_FIELD", "AI Raw Response")
-
-# ==================================================
-# Style/RAG config (optional)
+# Style/RAG config
 # ==================================================
 EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")
-
-# Defaults lowered to prevent huge prompts / slow generations
-TOP_STYLE_SAMPLES = int(os.getenv("TOP_STYLE_SAMPLES", "2"))          # recommend 2–3
-MAX_STYLE_CHARS_EACH = int(os.getenv("MAX_STYLE_CHARS_EACH", "2500")) # trim references
-MAX_STYLE_SAMPLES_FETCH = int(os.getenv("MAX_STYLE_SAMPLES_FETCH", "200"))  # fetch embedded, then filter
+TOP_STYLE_SAMPLES = int(os.getenv("TOP_STYLE_SAMPLES", "2"))
+MAX_STYLE_CHARS_EACH = int(os.getenv("MAX_STYLE_CHARS_EACH", "2500"))
+MAX_STYLE_SAMPLES_FETCH = int(os.getenv("MAX_STYLE_SAMPLES_FETCH", "200"))
 
 # Article fields (Airtable)
 CLIENT_LINK_FIELD = os.getenv("CLIENT_LINK_FIELD", "Client")  # link-to-record field on Articles
@@ -90,12 +93,15 @@ CLIENT_FORMAT_RULES_FIELD = os.getenv("CLIENT_FORMAT_RULES_FIELD", "Format Rules
 CLIENT_BANNED_PHRASES_FIELD = os.getenv("CLIENT_BANNED_PHRASES_FIELD", "Banned Phrases")
 
 # Style library fields
-STYLE_CLIENT_LINK_FIELD = os.getenv("STYLE_CLIENT_LINK_FIELD", "Client")  # link-to-record to Clients
+STYLE_CLIENT_LINK_FIELD = os.getenv("STYLE_CLIENT_LINK_FIELD", "Client")
 STYLE_TEXT_FIELD = os.getenv("STYLE_TEXT_FIELD", "Chunk Text")
 STYLE_VECTOR_FIELD = os.getenv("STYLE_VECTOR_FIELD", "Embedding Vector")
 STYLE_STATUS_FIELD = os.getenv("STYLE_STATUS_FIELD", "Embedding Status")
 STYLE_STATUS_EMBEDDED = os.getenv("STYLE_STATUS_EMBEDDED", "Embedded")
-STYLE_SAMPLE_TITLE_FIELD = os.getenv("STYLE_SAMPLE_TITLE_FIELD", "Sample Title")  # primary or title
+STYLE_SAMPLE_TITLE_FIELD = os.getenv("STYLE_SAMPLE_TITLE_FIELD", "Sample Title")
+
+# OpenAI generation model
+GEN_MODEL = os.getenv("GEN_MODEL", "gpt-5.2")
 
 # ==================================================
 # ENV CHECK
@@ -126,13 +132,13 @@ def log(msg: str):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 # ==================================================
-# OPENAI CLIENT (proxy-safe) — increased read timeout
+# OPENAI CLIENT (proxy-safe)
 # ==================================================
 http_client = httpx.Client(
     timeout=httpx.Timeout(
-        180.0,   # total (fallback)
+        240.0,   # total (fallback)
         connect=20.0,
-        read=180.0,
+        read=240.0,
         write=60.0,
         pool=60.0,
     ),
@@ -175,6 +181,7 @@ def update_record(record_id: str, fields: dict):
     return r.json()
 
 def safe_patch_articles(record_id: str, fields: dict):
+    # best-effort patch; never crash the record
     try:
         update_record(record_id, fields)
     except Exception as e:
@@ -238,11 +245,6 @@ def _normalize_banned_phrases(v):
     return str(v).strip()
 
 def fetch_style_samples_for_client(client_record_id: str, max_records: int = 200):
-    """
-    Robust approach:
-    - Airtable filter only on Embedding Status = Embedded
-    - Filter by linked Client record_id in Python
-    """
     formula = f'{{{STYLE_STATUS_FIELD}}}="{STYLE_STATUS_EMBEDDED}"'
     data = airtable_get_table(
         AIRTABLE_STYLE_TABLE,
@@ -281,13 +283,12 @@ def select_top_style_samples(style_records: list, query_embedding: list, top_k: 
     return scored[:top_k]
 
 # ==================================================
-# CONTENT GENERATION (with style RAG)
+# PROMPTING
 # ==================================================
 def build_prompt(article_fields: dict, client_fields: dict, top_samples_scored: list):
     topic = article_fields.get(TOPIC_FIELD_1) or article_fields.get(TOPIC_FIELD_2) or "Write an original article."
     word_count = article_fields.get("word count") or article_fields.get("Word Count") or 700
 
-    # We no longer use Tone / Special Content Instructions (safe to delete those fields)
     style_rules = (client_fields.get(CLIENT_STYLE_RULES_FIELD) or "").strip()
     format_rules = (client_fields.get(CLIENT_FORMAT_RULES_FIELD) or "").strip()
     banned_phrases = _normalize_banned_phrases(client_fields.get(CLIENT_BANNED_PHRASES_FIELD))
@@ -341,24 +342,120 @@ Formatting rules (global):
 - Put a clear title on the first line.
 - Use subheadings.
 - Do not use bullet lists or hyphen bullets.
-- Avoid repetitive filler.
+- Avoid repetitive filler and generic transitions.
 - Do not mention AI or detectors.
 """.strip()
 
     return prompt, used_titles_block
 
+# ==================================================
+# OPENAI: Responses API helpers
+# ==================================================
+def _responses_text(resp) -> str:
+    # Most SDK versions expose output_text; fallback to traversing output.
+    text = getattr(resp, "output_text", None)
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    out = getattr(resp, "output", None) or []
+    chunks = []
+    for item in out:
+        # item may be dict-like or object-like
+        content = None
+        try:
+            content = item.get("content", None)
+        except Exception:
+            content = getattr(item, "content", None)
+
+        if not content:
+            continue
+        for c in content:
+            try:
+                ctype = c.get("type")
+                ctext = c.get("text")
+            except Exception:
+                ctype = getattr(c, "type", None)
+                ctext = getattr(c, "text", None)
+            if ctype in ("output_text", "text") and ctext:
+                chunks.append(ctext)
+    return "".join(chunks).strip()
+
 def generate_article(prompt: str) -> str:
-    resp = client.chat.completions.create(
-        model="gpt-5",
-        messages=[
+    resp = client.responses.create(
+        model=GEN_MODEL,
+        input=[
             {"role": "system", "content": "You are a professional content writer who follows instructions exactly."},
             {"role": "user", "content": prompt},
         ],
     )
-    return (resp.choices[0].message.content or "").strip()
+    return _responses_text(resp)
+
+def polish_article(original_text: str) -> str:
+    # This is a quality edit pass. Not a “detector” pass.
+    prompt = f"""
+You are editing an article to improve natural human flow.
+
+Hard rules:
+- Do NOT change the topic or meaning.
+- Keep the title and subheadings structure.
+- Do NOT remove required links/anchors.
+- Keep roughly the same length (do not shorten significantly).
+- Do not add bullet lists.
+
+Edit goals:
+- Reduce generic phrasing and repetitive transitions.
+- Vary sentence rhythm and paragraph pacing.
+- Make wording feel specific, grounded, and clean.
+- Keep it informative and non-promotional.
+
+Article:
+{original_text}
+""".strip()
+
+    resp = client.responses.create(
+        model=GEN_MODEL,
+        input=[
+            {"role": "system", "content": "You are a careful editor."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    text = _responses_text(resp)
+    return text if text else original_text
+
+def targeted_rewrite(article_text: str) -> str:
+    # One controlled rewrite to improve clarity/specificity if QC flags it.
+    prompt = f"""
+Rewrite ONLY:
+- the introduction, and
+- the two weakest sections (choose them yourself).
+
+Keep:
+- the title
+- subheadings overall (you may lightly rephrase headings)
+- the same meaning and constraints
+- any required links/anchors exactly as they appear
+
+Rules:
+- No bullet lists.
+- Keep similar length.
+- Reduce generic phrasing. Use clearer, more concrete wording.
+
+Article:
+{article_text}
+""".strip()
+
+    resp = client.responses.create(
+        model=GEN_MODEL,
+        input=[
+            {"role": "system", "content": "You rewrite selectively and carefully."},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    text = _responses_text(resp)
+    return text if text else article_text
 
 # ==================================================
-# ZeroGPT DETECTION (correct request format)
+# ZeroGPT DETECTION
 # ==================================================
 def zerogpt_detect(text: str) -> dict:
     headers = {"Content-Type": "application/json", "ApiKey": ZEROGPT_API_KEY}
@@ -391,7 +488,7 @@ def zerogpt_detect(text: str) -> dict:
 # ==================================================
 def process_one(record: dict):
     record_id = record["id"]
-    fields = record.get("fields", {})
+    fields = record.get("fields", {}) or {}
     start = time.time()
 
     def check_timeout(step: str):
@@ -404,7 +501,7 @@ def process_one(record: dict):
         raise RuntimeError(f'Missing linked Client in field "{CLIENT_LINK_FIELD}".')
     client_record_id = client_link[0]
 
-    # set Drafting + timestamp
+    # Set Drafting + timestamp
     drafting_patch = {
         STATUS_FIELD: DRAFTING_VALUE,
         LAST_ERROR_FIELD: "",
@@ -413,12 +510,6 @@ def process_one(record: dict):
     log(f"Setting Drafting: {record_id}")
     update_record(record_id, drafting_patch)
     check_timeout("drafting_patch")
-
-    # Debug: show config
-    log(f"Client record id from Article: {client_record_id}")
-    log(f"STYLE_CLIENT_LINK_FIELD: {STYLE_CLIENT_LINK_FIELD}")
-    log(f"STYLE_STATUS_FIELD: {STYLE_STATUS_FIELD} = {STYLE_STATUS_EMBEDDED}")
-    log(f"TOP_STYLE_SAMPLES: {TOP_STYLE_SAMPLES}, MAX_STYLE_CHARS_EACH: {MAX_STYLE_CHARS_EACH}")
 
     # Fetch client rules
     log("Fetching client rules...")
@@ -433,8 +524,8 @@ def process_one(record: dict):
     if not style_recs:
         raise RuntimeError(
             "No embedded style samples found for this client. "
-            "Check that Style Library rows are linked to the same Client record as the Article, "
-            "and that Embedding Status is exactly 'Embedded'."
+            "Check Style Library rows are linked to the same Client record as the Article, "
+            "and Embedding Status is exactly 'Embedded'."
         )
     check_timeout("style_fetch")
 
@@ -455,49 +546,105 @@ def process_one(record: dict):
     # Build prompt
     prompt, used_titles_block = build_prompt(fields, client_fields, top_scored)
 
-    # Optional: write debug field if present
-    safe_patch_articles(record_id, {STYLE_SAMPLES_USED_FIELD: used_titles_block})
+    # Optional debug field
+    if STYLE_SAMPLES_USED_FIELD and used_titles_block:
+        safe_patch_articles(record_id, {STYLE_SAMPLES_USED_FIELD: used_titles_block})
 
-    # Generate
-    log("OpenAI generation start...")
-    article = generate_article(prompt)
-    log(f"OpenAI generation done (len={len(article)} chars).")
-    check_timeout("openai_done")
+    # Draft generation
+    log("OpenAI draft generation start...")
+    draft = generate_article(prompt)
+    log(f"OpenAI draft done (len={len(draft)} chars).")
+    check_timeout("openai_draft_done")
 
-    if not article or len(article) < 200:
-        raise RuntimeError("Generated article too short.")
+    if not draft or len(draft) < 200:
+        raise RuntimeError("Generated draft too short.")
 
-    # ZeroGPT
+    # Polish pass
+    log("OpenAI polish pass start...")
+    article = polish_article(draft)
+    log(f"OpenAI polish pass done (len={len(article)} chars).")
+    check_timeout("openai_polish_done")
+
+    # QC (ZeroGPT)
     log("ZeroGPT start...")
     qc = zerogpt_detect(article)
     log(f"ZeroGPT done (qc_error={qc.get('error')}, score={qc.get('score')}).")
     check_timeout("zerogpt_done")
 
+    # Prepare patch base
     patch = {
         FINAL_TEXT_FIELD: article,
         AI_RAW_FIELD: json.dumps(qc, ensure_ascii=False),
+        LAST_ERROR_FIELD: "",
     }
+
+    # attempts
+    attempts = 0
+    try:
+        attempts = int(fields.get(QC_ATTEMPTS_FIELD) or 0)
+    except Exception:
+        attempts = 0
+    patch[QC_ATTEMPTS_FIELD] = attempts + 1
 
     if qc.get("error"):
         patch[STATUS_FIELD] = NEEDS_REVIEW_VALUE
-        patch[LAST_ERROR_FIELD] = f"ZeroGPT error: {qc.get('http_status')}"
+        patch[QC_NOTES_FIELD] = f"QC service error (status={qc.get('http_status')})."
         update_record(record_id, patch)
         return
 
     score = qc.get("score")
     if score is None:
         patch[STATUS_FIELD] = NEEDS_REVIEW_VALUE
-        patch[LAST_ERROR_FIELD] = "ZeroGPT did not return a score."
+        patch[QC_NOTES_FIELD] = "QC did not return a numeric score."
         update_record(record_id, patch)
         return
 
     patch[AI_SCORE_FIELD] = float(score)
 
+    # Routing
     if float(score) >= ZEROGPT_THRESHOLD:
-        patch[STATUS_FIELD] = NEEDS_REVIEW_VALUE
-    else:
-        patch[STATUS_FIELD] = DELIVERED_VALUE
+        # One controlled retry, then human edit
+        if attempts < 1:
+            log("Score above threshold; running one targeted rewrite...")
+            rewritten = targeted_rewrite(article)
 
+            # Re-QC immediately (same cycle) to avoid waiting another poll
+            log("ZeroGPT re-check after targeted rewrite...")
+            qc2 = zerogpt_detect(rewritten)
+            log(f"ZeroGPT re-check done (qc_error={qc2.get('error')}, score={qc2.get('score')}).")
+
+            patch[FINAL_TEXT_FIELD] = rewritten
+            patch[AI_RAW_FIELD] = json.dumps(qc2, ensure_ascii=False)
+
+            if qc2.get("error") or qc2.get("score") is None:
+                patch[STATUS_FIELD] = NEEDS_REVIEW_VALUE
+                patch[QC_NOTES_FIELD] = "Re-check failed or missing score after rewrite."
+                update_record(record_id, patch)
+                return
+
+            patch[AI_SCORE_FIELD] = float(qc2["score"])
+
+            if float(qc2["score"]) < ZEROGPT_THRESHOLD:
+                patch[STATUS_FIELD] = DELIVERED_VALUE
+                patch[QC_NOTES_FIELD] = "Passed after one targeted rewrite."
+            else:
+                patch[STATUS_FIELD] = HUMAN_EDIT_VALUE
+                patch[QC_NOTES_FIELD] = "Still above threshold after one rewrite; routed to human edit."
+                if HUMAN_EDIT_REQUIRED_FIELD:
+                    patch[HUMAN_EDIT_REQUIRED_FIELD] = True
+
+            update_record(record_id, patch)
+            return
+
+        patch[STATUS_FIELD] = HUMAN_EDIT_VALUE
+        patch[QC_NOTES_FIELD] = "Above threshold; already attempted rewrite. Routed to human edit."
+        if HUMAN_EDIT_REQUIRED_FIELD:
+            patch[HUMAN_EDIT_REQUIRED_FIELD] = True
+        update_record(record_id, patch)
+        return
+
+    patch[STATUS_FIELD] = DELIVERED_VALUE
+    patch[QC_NOTES_FIELD] = "Passed QC."
     log(f"Writing final status: {record_id} -> {patch[STATUS_FIELD]}")
     update_record(record_id, patch)
 
@@ -513,6 +660,7 @@ def main():
     log(f"STYLE TABLE: {AIRTABLE_STYLE_TABLE}")
     log(f"STATUS_FIELD: {STATUS_FIELD} READY_VALUE: {READY_VALUE}")
     log(f"POLL_SECONDS: {POLL_SECONDS} MAX_RECORDS_PER_CYCLE: {MAX_RECORDS_PER_CYCLE}")
+    log(f"GEN_MODEL: {GEN_MODEL}")
     log(f"EMBED_MODEL: {EMBED_MODEL} TOP_STYLE_SAMPLES: {TOP_STYLE_SAMPLES} MAX_STYLE_CHARS_EACH: {MAX_STYLE_CHARS_EACH}")
     log(f"AIRTABLE_HTTP_TIMEOUT: {AIRTABLE_HTTP_TIMEOUT} ZEROGPT_HTTP_TIMEOUT: {ZEROGPT_HTTP_TIMEOUT}")
     log(f"ZeroGPT URL: {ZEROGPT_API_URL}")
